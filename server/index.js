@@ -195,7 +195,7 @@ app.get('/api/report/:specialty/pdf', authMiddleware, (req, res) => {
     freq[e.normalized_symptom].totalSev += e.severity;
   });
 
-  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+  const doc = new PDFDocument({ size: 'A4', margin: 40, autoFirstPage: true });
 
   const fileName = `noted-report-${specialty}-${new Date().toISOString().split('T')[0]}.pdf`;
   res.setHeader('Content-Type', 'application/pdf');
@@ -203,89 +203,171 @@ app.get('/api/report/:specialty/pdf', authMiddleware, (req, res) => {
   res.setHeader('Content-Transfer-Encoding', 'binary');
   doc.pipe(res);
 
-  // Header
-  doc.fontSize(24).font('Helvetica-Bold').text('Noted.', { align: 'left' });
-  doc.fontSize(10).font('Helvetica').fillColor('#888')
-    .text(`Doctor Visit Report — ${specialty.charAt(0).toUpperCase() + specialty.slice(1)}`, { align: 'left' });
-  doc.text(`Generated: ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}`, { align: 'left' });
-  doc.moveDown(1.5);
+  const specialtyTheme = {
+    neurologist: { primary: '#6c5ce7', light: '#f0eeff', label: 'Neurology Consultation Report', sub: 'Cranial, Migraine & Neurological Assessment' },
+    gastroenterologist: { primary: '#00cec9', light: '#e6fffe', label: 'Gastroenterology Report', sub: 'Upper & Lower GI Motility & Reflux Assessment' },
+    orthopedist: { primary: '#e17055', light: '#fff4f0', label: 'Orthopedic & Spine Report', sub: 'Musculoskeletal, Lumbar & Postural Assessment' },
+    psychiatrist: { primary: '#e84393', light: '#fdeef6', label: 'Mental Health & Cardiology Report', sub: 'Autonomic, Stress, Palpitations & Sleep Assessment' },
+    general: { primary: '#6c5ce7', light: '#f0eeff', label: 'Clinical Health Summary', sub: 'Comprehensive Multisystem Longitudinal Review' },
+  };
 
-  // Summary
-  doc.fontSize(14).font('Helvetica-Bold').fillColor('#333').text('Summary');
-  doc.moveDown(0.3);
-  doc.fontSize(10).font('Helvetica').fillColor('#555');
-  doc.text(`Total logged entries: ${entries.length}`);
-  doc.text(`Unique symptoms: ${Object.keys(freq).length}`);
-  doc.text(`Patterns detected: ${patterns.length}`);
-  doc.text(`Active treatments: ${treatments.filter((t) => !t.end_date).length}`);
-  if (entries.length > 0) {
-    const avgSev = (entries.reduce((a, b) => a + b.severity, 0) / entries.length).toFixed(1);
-    doc.text(`Average severity: ${avgSev} / 5`);
-  }
-  doc.moveDown(1);
+  const theme = specialtyTheme[specialty] || specialtyTheme.general;
+  const userName = req.user?.name || 'Patient';
 
-  // Symptom Frequency
-  doc.fontSize(14).font('Helvetica-Bold').fillColor('#333').text('Symptom Frequency');
-  doc.moveDown(0.3);
-  for (const [symptom, data] of Object.entries(freq).sort((a, b) => b[1].count - a[1].count)) {
+  // ──── Top Header Banner ────
+  doc.rect(40, 40, 515, 80).fill(theme.primary);
+  doc.fillColor('#ffffff').fontSize(22).font('Helvetica-Bold').text('Noted.', 58, 55);
+  doc.fontSize(8).font('Helvetica-Bold').fillColor('#ffffff').text('CLINICAL VISIT DOSSIER', 58, 82);
+
+  doc.fillColor('#ffffff').fontSize(13).font('Helvetica-Bold').text(theme.label.toUpperCase(), 180, 55, { align: 'right', width: 355 });
+  doc.fontSize(8.5).font('Helvetica').fillColor('#f0f2f7').text(theme.sub, 180, 72, { align: 'right', width: 355 });
+  doc.fontSize(8).text(`Patient: ${userName}  |  Generated: ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}`, 180, 88, { align: 'right', width: 355 });
+
+  // ──── KPI Cards (4 Grid Boxes) ────
+  const kpiY = 135;
+  const cardW = 120;
+  const cardH = 50;
+  const cardGap = 11.6;
+
+  const avgSev = entries.length ? (entries.reduce((a, b) => a + b.severity, 0) / entries.length).toFixed(1) : '0';
+  const kpis = [
+    { label: 'TOTAL ENTRIES', val: `${entries.length}`, color: '#6c5ce7', bg: '#f4f2ff' },
+    { label: 'AVG SEVERITY', val: `${avgSev} / 5`, color: '#e17055', bg: '#fff4f0' },
+    { label: 'PATTERNS FOUND', val: `${patterns.length}`, color: '#00b894', bg: '#e6f9f3' },
+    { label: 'ACTIVE TREATMENTS', val: `${treatments.filter(t => !t.end_date).length}`, color: '#00cec9', bg: '#e6fffe' },
+  ];
+
+  kpis.forEach((kpi, i) => {
+    const x = 40 + i * (cardW + cardGap);
+    doc.roundedRect(x, kpiY, cardW, cardH, 6).fillAndStroke(kpi.bg, kpi.color);
+    doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#7a829e').text(kpi.label, x + 8, kpiY + 10, { width: cardW - 16, align: 'center' });
+    doc.fontSize(15).font('Helvetica-Bold').fillColor(kpi.color).text(kpi.val, x + 8, kpiY + 24, { width: cardW - 16, align: 'center' });
+  });
+
+  let curY = 202;
+
+  // ──── SECTION 1: Symptom Frequency Table ────
+  doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Symptom Frequency & Intensity (Last 90 Days)', 40, curY);
+  curY += 18;
+
+  doc.roundedRect(40, curY, 515, 22, 4).fill(theme.primary);
+  doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#ffffff');
+  doc.text('Symptom Entity', 52, curY + 6);
+  doc.text('Occurrences', 260, curY + 6, { width: 80, align: 'center' });
+  doc.text('Avg Severity', 360, curY + 6, { width: 80, align: 'center' });
+  doc.text('Impact Level', 460, curY + 6, { width: 80, align: 'center' });
+  curY += 24;
+
+  const sortedFreq = Object.entries(freq).sort((a, b) => b[1].count - a[1].count).slice(0, 5);
+  sortedFreq.forEach(([symptom, data], idx) => {
+    const rowBg = idx % 2 === 0 ? '#f9fafd' : '#ffffff';
+    doc.rect(40, curY, 515, 20).fill(rowBg);
     const avg = (data.totalSev / data.count).toFixed(1);
-    doc.fontSize(10).font('Helvetica').fillColor('#555')
-      .text(`• ${symptom}: ${data.count} occurrence(s), avg severity ${avg}/5`);
-  }
-  doc.moveDown(1);
+    const sevNum = parseFloat(avg);
+    const impactLabel = sevNum >= 4 ? 'High' : sevNum >= 2.5 ? 'Moderate' : 'Mild';
+    const impactColor = sevNum >= 4 ? '#e17055' : sevNum >= 2.5 ? '#f39c12' : '#00b894';
 
-  // Patterns
+    doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#2d3436').text(symptom, 52, curY + 5);
+    doc.font('Helvetica').fillColor('#4a5568').text(`${data.count}`, 260, curY + 5, { width: 80, align: 'center' });
+    doc.text(`${avg} / 5`, 360, curY + 5, { width: 80, align: 'center' });
+    doc.font('Helvetica-Bold').fillColor(impactColor).text(impactLabel, 460, curY + 5, { width: 80, align: 'center' });
+    curY += 20;
+  });
+  curY += 14;
+
+  // ──── SECTION 2: Detected Patterns ────
   if (patterns.length > 0) {
-    doc.fontSize(14).font('Helvetica-Bold').fillColor('#333').text('Detected Patterns');
-    doc.moveDown(0.3);
-    patterns.forEach((p) => {
-      doc.fontSize(10).font('Helvetica-Bold').fillColor('#555')
-        .text(`${p.symptom} — ${p.confidence}% confidence`);
-      doc.font('Helvetica').text(`  ${p.pattern}`);
-      doc.fillColor('#888').text(`  ${p.suggestion}`);
-      doc.moveDown(0.3);
+    doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Detected Patterns & Clinical Correlations', 40, curY);
+    curY += 16;
+
+    patterns.slice(0, 3).forEach((p) => {
+      doc.roundedRect(40, curY, 515, 42, 5).fillAndStroke('#fcfdff', '#e2e6f0');
+      doc.rect(40, curY, 4, 42).fill(p.confidence >= 80 ? '#00b894' : '#6c5ce7');
+
+      doc.fontSize(9).font('Helvetica-Bold').fillColor('#1a1d2e').text(p.symptom, 54, curY + 7);
+      doc.fontSize(8).font('Helvetica-Bold').fillColor(p.confidence >= 80 ? '#00b894' : '#6c5ce7')
+        .text(`${p.confidence}% Statistical Confidence`, 350, curY + 7, { align: 'right', width: 190 });
+
+      doc.fontSize(8).font('Helvetica').fillColor('#4a5568').text(p.pattern, 54, curY + 20, { width: 485 });
+      doc.fontSize(7.5).font('Helvetica-Oblique').fillColor('#718096').text(p.suggestion, 54, curY + 30, { width: 485 });
+      curY += 48;
     });
-    doc.moveDown(0.5);
+    curY += 8;
   }
 
-  // Treatments
+  // ──── SECTION 3: Treatments ────
   if (treatments.length > 0) {
-    doc.fontSize(14).font('Helvetica-Bold').fillColor('#333').text('Treatments');
-    doc.moveDown(0.3);
-    treatments.forEach((t) => {
-      const status = t.end_date ? `Ended ${t.end_date.split('T')[0]}` : 'Active';
-      doc.fontSize(10).font('Helvetica').fillColor('#555')
-        .text(`• ${t.name} — Started ${t.start_date.split('T')[0]} (${status})`);
-      if (t.notes) doc.fillColor('#888').text(`  Notes: ${t.notes}`);
+    doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Active & Recent Treatments', 40, curY);
+    curY += 16;
+
+    treatments.slice(0, 3).forEach((t) => {
+      const isOngoing = !t.end_date;
+      const badgeColor = isOngoing ? '#00b894' : '#9098b1';
+      const badgeText = isOngoing ? 'ACTIVE' : 'COMPLETED';
+
+      doc.roundedRect(40, curY, 515, 34, 4).fillAndStroke('#fcfdff', '#e5e9f2');
+      doc.fontSize(9).font('Helvetica-Bold').fillColor('#2d3436').text(t.name, 52, curY + 6);
+
+      doc.fontSize(7.5).font('Helvetica-Bold').fillColor(badgeColor).text(badgeText, 470, curY + 6, { align: 'right', width: 70 });
+      doc.fontSize(7.5).font('Helvetica').fillColor('#718096')
+        .text(`Started: ${new Date(t.start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}${t.end_date ? `  |  Ended: ${new Date(t.end_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}` : ''}`, 52, curY + 18);
+      if (t.notes) {
+        doc.fontSize(7.5).font('Helvetica').fillColor('#4a5568').text(`Notes: ${t.notes}`, 220, curY + 18, { width: 320 });
+      }
+      curY += 38;
     });
-    doc.moveDown(1);
   }
 
-  // Doctor Questions
-  doc.fontSize(14).font('Helvetica-Bold').fillColor('#333').text('Predicted Doctor Questions');
-  doc.moveDown(0.3);
-  questions.forEach((q, i) => {
-    doc.fontSize(10).font('Helvetica').fillColor('#555').text(`${i + 1}. ${q}`);
-  });
-  doc.moveDown(1);
+  // ──── Page 2: Consultation Questions & Timeline ────
+  doc.addPage({ margin: 40 });
 
-  // Timeline (last 15 entries)
-  doc.fontSize(14).font('Helvetica-Bold').fillColor('#333').text('Recent Timeline');
-  doc.moveDown(0.3);
-  entries.slice(0, 15).forEach((e) => {
-    const date = new Date(e.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    doc.fontSize(9).font('Helvetica-Bold').fillColor('#555')
-      .text(`${date} — ${e.normalized_symptom} (severity ${e.severity}/5)`);
-    doc.font('Helvetica').fillColor('#777')
-      .text(`  "${e.raw_text}"`);
-    doc.moveDown(0.2);
+  // Header Banner Page 2
+  doc.rect(40, 40, 515, 30).fill(theme.primary);
+  doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold').text('NOTED. CLINICAL DOSSIER — CONTINUED', 52, 49);
+  doc.fontSize(8.5).font('Helvetica').text(`Patient: ${userName}  |  Specialty: ${specialty.toUpperCase()}`, 300, 50, { align: 'right', width: 240 });
+
+  let p2Y = 85;
+
+  // ──── SECTION 4: Doctor Questions Box ────
+  doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('High-Yield Questions for Consultation', 40, p2Y);
+  p2Y += 16;
+
+  const boxH = Math.max(80, 20 + questions.length * 18);
+  doc.roundedRect(40, p2Y, 515, boxH, 6).fillAndStroke(theme.light, theme.primary);
+  p2Y += 12;
+  questions.forEach((q, idx) => {
+    doc.fontSize(8.5).font('Helvetica-Bold').fillColor(theme.primary).text(`${idx + 1}.`, 54, p2Y);
+    doc.fontSize(8.5).font('Helvetica').fillColor('#2d3436').text(q, 70, p2Y, { width: 465 });
+    p2Y += 18;
+  });
+  p2Y += 16;
+
+  // ──── SECTION 5: Recent Timeline Logs ────
+  doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Recent Longitudinal Symptom Logs', 40, p2Y);
+  p2Y += 16;
+
+  entries.slice(0, 8).forEach((e) => {
+    const dateStr = new Date(e.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    doc.roundedRect(40, p2Y, 515, 36, 4).fillAndStroke('#ffffff', '#edf0f7');
+
+    const sevColor = e.severity >= 4 ? '#e17055' : e.severity >= 3 ? '#f39c12' : '#00b894';
+    doc.circle(52, p2Y + 12, 4).fill(sevColor);
+
+    doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#1a1d2e').text(`${e.normalized_symptom} (${e.severity}/5)`, 62, p2Y + 7);
+    doc.fontSize(7.5).font('Helvetica').fillColor('#8c94a8').text(dateStr, 350, p2Y + 7, { align: 'right', width: 190 });
+    if (e.body_location) {
+      doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#6c5ce7').text(`[${e.body_location}]`, 62, p2Y + 20);
+    }
+    doc.fontSize(7.5).font('Helvetica-Oblique').fillColor('#4a5568').text(`"${e.raw_text}"`, 170, p2Y + 20, { width: 370 });
+
+    p2Y += 40;
   });
 
-  // Footer
-  doc.moveDown(2);
-  doc.fontSize(8).font('Helvetica').fillColor('#aaa')
-    .text('This report is generated by Noted. for informational purposes only.', { align: 'center' })
-    .text('It does not contain medical advice or diagnoses.', { align: 'center' });
+  // ──── Footer ────
+  doc.rect(40, 785, 515, 1).fill('#e2e6f0');
+  doc.fontSize(7.5).font('Helvetica').fillColor('#a0aec0')
+    .text('Confidential Medical Summary Prepared by Noted. Platform. For clinical informational review only.', 40, 792, { align: 'center', width: 515 })
+    .text('Page 2 of 2  •  Not intended as a standalone diagnostic instrument.', 40, 802, { align: 'center', width: 515 });
 
   doc.end();
 });
