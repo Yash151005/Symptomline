@@ -318,6 +318,11 @@ app.get('/api/report/:specialty/pdf', authMiddleware, (req, res) => {
     });
   }
 
+  // ──── Page 1 Footer ────
+  doc.rect(40, 775, 515, 1).fill('#e2e6f0');
+  doc.fontSize(7.5).font('Helvetica').fillColor('#a0aec0')
+    .text('Confidential Medical Summary Prepared by Noted. Platform  •  Page 1 of 2', 40, 785, { align: 'center', width: 515, height: 11 });
+
   // ──── Page 2: Consultation Questions & Timeline ────
   doc.addPage({ margin: 40 });
 
@@ -337,7 +342,7 @@ app.get('/api/report/:specialty/pdf', authMiddleware, (req, res) => {
   p2Y += 12;
   questions.forEach((q, idx) => {
     doc.fontSize(8.5).font('Helvetica-Bold').fillColor(theme.primary).text(`${idx + 1}.`, 54, p2Y);
-    doc.fontSize(8.5).font('Helvetica').fillColor('#2d3436').text(q, 70, p2Y, { width: 465 });
+    doc.fontSize(8.5).font('Helvetica').fillColor('#2d3436').text(q, 70, p2Y, { width: 465, height: 14, ellipsis: true });
     p2Y += 18;
   });
   p2Y += 16;
@@ -346,28 +351,28 @@ app.get('/api/report/:specialty/pdf', authMiddleware, (req, res) => {
   doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Recent Longitudinal Symptom Logs', 40, p2Y);
   p2Y += 16;
 
-  entries.slice(0, 8).forEach((e) => {
+  entries.slice(0, 6).forEach((e) => {
     const dateStr = new Date(e.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     doc.roundedRect(40, p2Y, 515, 36, 4).fillAndStroke('#ffffff', '#edf0f7');
 
     const sevColor = e.severity >= 4 ? '#e17055' : e.severity >= 3 ? '#f39c12' : '#00b894';
     doc.circle(52, p2Y + 12, 4).fill(sevColor);
 
-    doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#1a1d2e').text(`${e.normalized_symptom} (${e.severity}/5)`, 62, p2Y + 7);
-    doc.fontSize(7.5).font('Helvetica').fillColor('#8c94a8').text(dateStr, 350, p2Y + 7, { align: 'right', width: 190 });
+    doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#1a1d2e').text(`${e.normalized_symptom} (${e.severity}/5)`, 62, p2Y + 7, { height: 12 });
+    doc.fontSize(7.5).font('Helvetica').fillColor('#8c94a8').text(dateStr, 350, p2Y + 7, { align: 'right', width: 190, height: 12 });
     if (e.body_location) {
-      doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#6c5ce7').text(`[${e.body_location}]`, 62, p2Y + 20);
+      doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#6c5ce7').text(`[${e.body_location}]`, 62, p2Y + 20, { height: 12 });
     }
-    doc.fontSize(7.5).font('Helvetica-Oblique').fillColor('#4a5568').text(`"${e.raw_text}"`, 170, p2Y + 20, { width: 370 });
+    doc.fontSize(7.5).font('Helvetica-Oblique').fillColor('#4a5568').text(`"${e.raw_text}"`, 170, p2Y + 20, { width: 370, height: 12, ellipsis: true });
 
     p2Y += 40;
   });
 
-  // ──── Footer ────
-  doc.rect(40, 785, 515, 1).fill('#e2e6f0');
+  // ──── Page 2 Footer ────
+  doc.rect(40, 775, 515, 1).fill('#e2e6f0');
   doc.fontSize(7.5).font('Helvetica').fillColor('#a0aec0')
-    .text('Confidential Medical Summary Prepared by Noted. Platform. For clinical informational review only.', 40, 792, { align: 'center', width: 515 })
-    .text('Page 2 of 2  •  Not intended as a standalone diagnostic instrument.', 40, 802, { align: 'center', width: 515 });
+    .text('Confidential Medical Summary Prepared by Noted. Platform. For clinical informational review only.', 40, 782, { align: 'center', width: 515, height: 11 })
+    .text('Page 2 of 2  •  Not intended as a standalone diagnostic instrument.', 40, 793, { align: 'center', width: 515, height: 11 });
 
   doc.end();
 });
