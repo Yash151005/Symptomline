@@ -71,12 +71,36 @@ export const analytics = {
 // Reports
 export const reports = {
   downloadPdf: async (specialty) => {
-    const blob = await request(`/report/${specialty}/pdf`);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `noted-report-${specialty}-${new Date().toISOString().split('T')[0]}.pdf`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const token = getToken();
+    const fileName = `noted-report-${specialty}-${new Date().toISOString().split('T')[0]}.pdf`;
+
+    const res = await fetch(`${API_BASE}/report/${specialty}/pdf?token=${encodeURIComponent(token)}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Failed to download PDF (${res.status})`);
+    }
+
+    const arrayBuffer = await res.arrayBuffer();
+    const pdfBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
+    const url = window.URL.createObjectURL(pdfBlob);
+
+    const link = document.createElement('a');
+    link.style.display = 'none';
+    link.href = url;
+    link.setAttribute('download', fileName);
+    document.body.appendChild(link);
+    link.click();
+
+    setTimeout(() => {
+      if (document.body.contains(link)) {
+        document.body.removeChild(link);
+      }
+      window.URL.revokeObjectURL(url);
+    }, 3000);
   },
 };

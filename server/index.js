@@ -197,8 +197,10 @@ app.get('/api/report/:specialty/pdf', authMiddleware, (req, res) => {
 
   const doc = new PDFDocument({ size: 'A4', margin: 50 });
 
+  const fileName = `noted-report-${specialty}-${new Date().toISOString().split('T')[0]}.pdf`;
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename=noted-report-${specialty}-${new Date().toISOString().split('T')[0]}.pdf`);
+  res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+  res.setHeader('Content-Transfer-Encoding', 'binary');
   doc.pipe(res);
 
   // Header

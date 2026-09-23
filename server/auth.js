@@ -17,10 +17,17 @@ export function generateToken() {
 
 export function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
+  let token = null;
+  if (header && header.startsWith('Bearer ')) {
+    token = header.slice(7);
+  } else if (req.query && req.query.token) {
+    token = req.query.token;
+  }
+
+  if (!token) {
     return res.status(401).json({ error: 'Not authenticated' });
   }
-  const token = header.slice(7);
+
   const session = db
     .prepare('SELECT * FROM sessions WHERE token = ?')
     .get(token);
