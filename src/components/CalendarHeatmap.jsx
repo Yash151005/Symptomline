@@ -1,5 +1,4 @@
-import { generateHeatmapData } from '../data/mockData';
-import { subDays } from 'date-fns';
+import { subDays, startOfDay, format } from 'date-fns';
 
 const CELL_SIZE = 14;
 const CELL_GAP = 3;
@@ -13,9 +12,32 @@ function getHeatColor(count, maxSeverity) {
   return 'rgba(108, 92, 231, 0.12)';
 }
 
-export default function CalendarHeatmap() {
-  const data = generateHeatmapData();
-  const startDate = subDays(new Date(), 89);
+export default function CalendarHeatmap({ entries = [] }) {
+  const startDate = startOfDay(subDays(new Date(), 89));
+
+  // Aggregate entries by day
+  const aggregated = {};
+  entries.forEach((e) => {
+    const d = startOfDay(new Date(e.timestamp)).getTime();
+    if (d >= startDate.getTime()) {
+      if (!aggregated[d]) aggregated[d] = { count: 0, maxSeverity: 0 };
+      aggregated[d].count++;
+      aggregated[d].maxSeverity = Math.max(aggregated[d].maxSeverity, e.severity);
+    }
+  });
+
+  const data = [];
+  for (let i = 0; i < 90; i++) {
+    const d = new Date(startDate.getTime() + i * 24 * 60 * 60 * 1000);
+    const ts = d.getTime();
+    data.push({
+      date: format(d, 'MMM d, yyyy'),
+      monthLabel: format(d, 'MMM'),
+      count: aggregated[ts]?.count || 0,
+      maxSeverity: aggregated[ts]?.maxSeverity || 0,
+    });
+  }
+
 
   const weeks = [];
   let currentWeek = [];

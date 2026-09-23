@@ -291,9 +291,13 @@ app.get('/api/report/:specialty/pdf', authMiddleware, (req, res) => {
 // ──── Stats ────
 app.get('/api/stats', authMiddleware, (req, res) => {
   const total = db.prepare('SELECT COUNT(*) as count FROM symptom_entries WHERE profile_id = ?').get(req.profileId).count;
-  const today = db.prepare(
-    "SELECT COUNT(*) as count FROM symptom_entries WHERE profile_id = ? AND date(timestamp) = date('now')"
-  ).get(req.profileId).count;
+  const today = db.prepare(`
+    SELECT COUNT(*) as count FROM symptom_entries 
+    WHERE profile_id = ? AND (
+      date(timestamp) = date('now') OR 
+      date(timestamp, 'localtime') = date('now', 'localtime')
+    )
+  `).get(req.profileId).count;
   const week = db.prepare(
     "SELECT COUNT(*) as count FROM symptom_entries WHERE profile_id = ? AND timestamp >= datetime('now', '-7 days')"
   ).get(req.profileId).count;

@@ -29,8 +29,16 @@ const CustomTooltip = ({ active, payload, label }) => {
   );
 };
 
-export function FrequencyChart() {
-  const data = getSymptomFrequency();
+export function FrequencyChart({ entries = [] }) {
+  const dataMap = {};
+  entries.forEach((e) => {
+    if (!dataMap[e.normalized_symptom]) dataMap[e.normalized_symptom] = 0;
+    dataMap[e.normalized_symptom]++;
+  });
+  const data = Object.keys(dataMap)
+    .map((k) => ({ name: k, count: dataMap[k] }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
 
   return (
     <div className="card-static" style={{ padding: '24px' }}>
@@ -62,13 +70,26 @@ export function FrequencyChart() {
   );
 }
 
-export function SeverityChart() {
-  const data = getSeverityOverTime();
+export function SeverityChart({ entries = [] }) {
+  const dataMap = {};
+  entries.forEach((e) => {
+    const d = new Date(e.timestamp).toISOString().split('T')[0];
+    if (!dataMap[d]) dataMap[d] = { total: 0, count: 0 };
+    dataMap[d].total += e.severity;
+    dataMap[d].count++;
+  });
+  const data = Object.keys(dataMap)
+    .sort()
+    .slice(-14) // Show last 14 days of data points
+    .map((k) => ({
+      date: new Date(k).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      severity: parseFloat((dataMap[k].total / dataMap[k].count).toFixed(1)),
+    }));
 
   return (
     <div className="card-static" style={{ padding: '24px' }}>
       <h3 style={{ fontSize: '0.9375rem', fontWeight: 700, marginBottom: 22 }}>
-        Severity Over Time
+        Severity Over Time (Recent)
       </h3>
       <ResponsiveContainer width="100%" height={200}>
         <AreaChart data={data}>

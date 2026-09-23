@@ -70,7 +70,7 @@ export default function TimelinePage() {
       </h1>
 
       <div style={{ marginBottom: 24 }} className="animate-fade-in">
-        <CalendarHeatmap />
+        <CalendarHeatmap entries={entries} />
       </div>
 
       {/* Tabs */}
@@ -103,9 +103,9 @@ export default function TimelinePage() {
         {activeTab === 'timeline' && <TimelineList entries={entries} onEdit={setEditEntry} />}
         {activeTab === 'charts' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <SymptomDiff />
-            <FrequencyChart />
-            <SeverityChart />
+            <SymptomDiff entries={entries} />
+            <FrequencyChart entries={entries} />
+            <SeverityChart entries={entries} />
           </div>
         )}
         {activeTab === 'patterns' && (

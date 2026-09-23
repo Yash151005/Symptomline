@@ -2,13 +2,29 @@ import { useState, useEffect } from 'react';
 import { analytics } from '../api';
 import { Activity, TrendingUp, TrendingDown, Minus } from 'lucide-react';
 
-export default function SymptomDiff() {
-  const [symptom, setSymptom] = useState('Headache');
+export default function SymptomDiff({ entries = [] }) {
+  // Extract unique symptoms sorted by frequency
+  const symptomCounts = {};
+  entries.forEach((e) => {
+    if (e.normalized_symptom) {
+      symptomCounts[e.normalized_symptom] = (symptomCounts[e.normalized_symptom] || 0) + 1;
+    }
+  });
+  const availableSymptoms = Object.keys(symptomCounts).sort((a, b) => symptomCounts[b] - symptomCounts[a]);
+
+  const [symptom, setSymptom] = useState(availableSymptoms[0] || 'Headache');
   const [days, setDays] = useState(60);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
+    if (availableSymptoms.length > 0 && (!symptom || !symptomCounts[symptom])) {
+      setSymptom(availableSymptoms[0]);
+    }
+  }, [entries]);
+
+  useEffect(() => {
+    if (!symptom) return;
     async function load() {
       setLoading(true);
       try {
@@ -31,13 +47,19 @@ export default function SymptomDiff() {
           Symptom Evolution (Diff)
         </h3>
         <div style={{ display: 'flex', gap: 8 }}>
-          <input
+          <select
             className="input"
-            style={{ width: 150, padding: '6px 12px', fontSize: '0.8125rem', height: 32 }}
+            style={{ minWidth: 160, padding: '6px 12px', fontSize: '0.8125rem', height: 32 }}
             value={symptom}
             onChange={(e) => setSymptom(e.target.value)}
-            placeholder="Symptom (e.g. Headache)"
-          />
+          >
+            {availableSymptoms.map((s) => (
+              <option key={s} value={s}>
+                {s} ({symptomCounts[s]} logs)
+              </option>
+            ))}
+            {availableSymptoms.length === 0 && <option value="Headache">Headache</option>}
+          </select>
           <select
             className="input"
             style={{ padding: '6px 12px', fontSize: '0.8125rem', height: 32 }}

@@ -212,6 +212,20 @@ export function predictDoctorQuestions(profileId, specialty = 'general') {
       'Are you taking any acid-reducing medications currently?',
       'Is there a family history of GI conditions?',
     ],
+    orthopedist: [
+      'How would you describe the spine discomfort — aching, burning, stabbing, or stiffness?',
+      'Does pain or numbness radiate downward toward the hip, thigh, or calf?',
+      'Which postures or daily activities noticeably aggravate or relieve the symptoms?',
+      'Have you noticed progressive muscle weakness, tingling, or loss of balance?',
+      'Has physical therapy, stretching, or ergonomic modification provided relief?',
+    ],
+    psychiatrist: [
+      'When you experience rapid heart rate or acute tension, what specific triggers precede it?',
+      'How severely have sleep latency and early awakenings impacted daily performance?',
+      'Do palpitations or panic sensations occur during rest periods or during high workload?',
+      'How much caffeine, nicotine, or stimulant intake occurs on high-symptom days?',
+      'What relaxation, breathing, or cognitive coping strategies have you attempted?',
+    ],
     general: [
       'How long have these symptoms been present?',
       'Have you noticed any patterns — times of day, triggers, or correlations?',

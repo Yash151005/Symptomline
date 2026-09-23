@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import {
   FileText, X, Download, Brain, Stethoscope, HeartPulse,
-  ChevronRight, MessageCircleQuestion, Pill, BarChart3, Loader2
+  ChevronRight, MessageCircleQuestion, Pill, BarChart3, Loader2, Activity
 } from 'lucide-react';
 import {
   mockEntries, mockPatterns, mockDoctorQuestions,
@@ -11,9 +11,11 @@ import { format } from 'date-fns';
 import { entries as entriesApi, analytics, treatments as treatmentsApi, reports } from '../api';
 
 const specialties = [
-  { id: 'neurologist', label: 'Neurologist', icon: Brain, desc: 'Headaches, migraines, dizziness', color: '#6c5ce7', bg: '#f0eeff' },
-  { id: 'gastroenterologist', label: 'Gastroenterologist', icon: Stethoscope, desc: 'Stomach, digestion, reflux', color: '#00cec9', bg: '#e6fffe' },
-  { id: 'general', label: 'General / PCP', icon: HeartPulse, desc: 'Overall health, multiple symptoms', color: '#fd79a8', bg: '#fff0f7' },
+  { id: 'neurologist', label: 'Neurologist', icon: Brain, desc: 'Headaches, migraines, dizziness, brain fog', color: '#6c5ce7', bg: '#f0eeff' },
+  { id: 'gastroenterologist', label: 'Gastroenterologist', icon: Stethoscope, desc: 'Stomach, digestion, acid reflux, cramps', color: '#00cec9', bg: '#e6fffe' },
+  { id: 'orthopedist', label: 'Orthopedist / PT', icon: Activity, desc: 'Back pain, sciatica, muscle spasms, joints', color: '#e17055', bg: '#fff4f0' },
+  { id: 'psychiatrist', label: 'Cardiology / Mental Health', icon: HeartPulse, desc: 'Anxiety, palpitations, insomnia, stress', color: '#e84393', bg: '#fdeef6' },
+  { id: 'general', label: 'General / PCP', icon: HeartPulse, desc: 'Overall health, comprehensive timeline', color: '#fd79a8', bg: '#fff0f7' },
 ];
 
 function ReportPreview({ specialty, onClose }) {
@@ -58,17 +60,26 @@ function ReportPreview({ specialty, onClose }) {
 
   const { entries, patterns, treatments, questions, useMock } = data;
 
-  const relevantPatterns = patterns.filter((p) => {
-    if (specialty.id === 'neurologist') return ['Headache', 'Migraine', 'Dizziness'].includes(p.symptom);
-    if (specialty.id === 'gastroenterologist') return ['Acid reflux', 'Nausea', 'Bloating', 'Stomach cramps'].includes(p.symptom);
-    return true;
-  });
+  const specKeywords = {
+    neurologist: ['headache', 'migraine', 'dizziness', 'neck', 'brain fog', 'aura'],
+    gastroenterologist: ['acid reflux', 'nausea', 'bloat', 'cramp', 'stomach', 'indigestion', 'epigastric'],
+    orthopedist: ['back', 'lumbar', 'spasm', 'sciatica', 'spine', 'stiff', 'joint'],
+    psychiatrist: ['anxiety', 'palpitation', 'insomnia', 'panic', 'breath', 'stress', 'racing'],
+  };
 
-  const relevantEntries = entries.filter((e) => {
-    if (specialty.id === 'neurologist') return ['Headache', 'Migraine', 'Dizziness', 'Neck stiffness'].includes(e.normalized_symptom);
-    if (specialty.id === 'gastroenterologist') return ['Acid reflux', 'Nausea', 'Bloating', 'Stomach cramps'].includes(e.normalized_symptom);
-    return true;
-  });
+  const keywords = specKeywords[specialty.id];
+
+  let relevantPatterns = patterns;
+  if (keywords && patterns.length > 0) {
+    const matched = patterns.filter((p) => keywords.some((k) => p.symptom?.toLowerCase().includes(k)));
+    if (matched.length > 0) relevantPatterns = matched;
+  }
+
+  let relevantEntries = entries;
+  if (keywords && entries.length > 0) {
+    const matched = entries.filter((e) => keywords.some((k) => e.normalized_symptom?.toLowerCase().includes(k)));
+    if (matched.length > 0) relevantEntries = matched;
+  }
 
   const avgSev = relevantEntries.length ? (relevantEntries.reduce((a, b) => a + b.severity, 0) / relevantEntries.length).toFixed(1) : 0;
 
