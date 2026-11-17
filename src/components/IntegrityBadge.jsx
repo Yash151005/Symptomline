@@ -7,7 +7,7 @@ const STATES = {
   },
   unattested: {
     icon: ShieldQuestion, color: '#b7791f', bg: '#fff8e6', border: '#f5dfa8', title: 'Partially attested',
-    text: 'Some entries were created before the audit ledger existed, so their history cannot be verified.',
+    text: 'Current snapshots are chained, but entries imported from before the audit ledger existed have no verifiable original history.',
   },
   tampered: {
     icon: ShieldAlert, color: '#c0392b', bg: '#fff5f5', border: '#f5c6cb', title: 'Integrity check failed',
@@ -37,6 +37,7 @@ export default function IntegrityBadge({ integrity, timeliness, compact = false 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 14px', fontSize: '0.6875rem', color: 'var(--color-text-secondary)' }}>
         <span>{integrity.events} audit events</span>
         <span>{integrity.edited_entries} entries edited</span>
+        {integrity.imported_entries > 0 && <span>{integrity.imported_entries} imported without prior history</span>}
         {integrity.deleted_entries > 0 && <span>{integrity.deleted_entries} deleted</span>}
         {t?.pct_realtime != null && (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }} title="Share of entries logged within 6 hours of the symptom. Higher means less recall bias.">

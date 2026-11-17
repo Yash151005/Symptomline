@@ -74,6 +74,33 @@ export const appendLedger = db.transaction((profileId, entry, action, at = new D
 });
 
 /**
+ * Give existing entries a verifiable starting point when upgrading a database
+ * that predates the audit ledger. This attests the imported snapshot only;
+ * verifyLedger() keeps the profile partially attested because prior history
+ * is unavailable.
+ */
+export function backfillLegacyEntries() {
+  const legacy = db.prepare(`
+    SELECT e.*
+    FROM symptom_entries e
+    WHERE NOT EXISTS (
+      SELECT 1 FROM audit_ledger l
+      WHERE l.profile_id = e.profile_id AND l.entry_id = e.id
+    )
+    ORDER BY e.profile_id, e.created_at, e.id
+  `).all();
+
+  legacy.forEach((entry) => {
+    const recordedAt = entry.created_at && !Number.isNaN(Date.parse(entry.created_at))
+      ? new Date(entry.created_at).toISOString()
+      : new Date().toISOString();
+    appendLedger(entry.profile_id, entry, 'import', recordedAt);
+  });
+
+  return legacy.length;
+}
+
+/**
  * Walk the chain and reconcile it with the live entries table.
  * status: 'verified'   chain intact and every live entry matches its latest snapshot
  *         'unattested' chain intact, but some entries pre-date the ledger
@@ -85,6 +112,7 @@ export function verifyLedger(profileId) {
   let brokenAt = null;
   const latest = new Map();
   const editCounts = new Map();
+  const importedEntries = new Set();
 
   for (const r of rows) {
     const expected = hashEvent(prev, r);
@@ -95,6 +123,7 @@ export function verifyLedger(profileId) {
     prev = r.hash;
     latest.set(r.entry_id, r);
     if (r.action === 'update') editCounts.set(r.entry_id, (editCounts.get(r.entry_id) || 0) + 1);
+    if (r.action === 'import') importedEntries.add(r.entry_id);
   }
 
   const live = db.prepare('SELECT * FROM symptom_entries WHERE profile_id = ?').all(profileId);
@@ -115,7 +144,11 @@ export function verifyLedger(profileId) {
   }
 
   const deleted = [...latest.values()].filter((r) => r.action === 'delete').length;
-  const status = brokenAt !== null || mismatched.length ? 'tampered' : unattested ? 'unattested' : 'verified';
+  const status = brokenAt !== null || mismatched.length
+    ? 'tampered'
+    : unattested || importedEntries.size
+      ? 'unattested'
+      : 'verified';
 
   return {
     status,
@@ -124,6 +157,7 @@ export function verifyLedger(profileId) {
     broken_at_seq: brokenAt,
     mismatched_entries: mismatched,
     unattested_entries: unattested,
+    imported_entries: importedEntries.size,
     edited_entries: editCounts.size,
     deleted_entries: deleted,
     live_entries: live.length,

@@ -10,7 +10,7 @@ import { normalizeSymptom } from './normalizer.js';
 import { detectPatterns, getSymptomDiff, predictDoctorQuestions, getTriggerAnalysis } from './patterns.js';
 import { screenRedFlags } from './redflags.js';
 import { localDayKey } from './stats.js';
-import { appendLedger, verifyLedger, entryHistory, loggingTimeliness, canonical, entrySnapshot } from './ledger.js';
+import { appendLedger, backfillLegacyEntries, verifyLedger, entryHistory, loggingTimeliness, canonical, entrySnapshot } from './ledger.js';
 import { createShare, listShares, revokeShare, shareAccessLog, openShare } from './sharing.js';
 import { collectReportData, renderReportPdf, clinicianSummary } from './report.js';
 import { buildFhirBundle } from './fhir.js';
@@ -28,6 +28,11 @@ app.use(cors({ origin: allowedOrigins }));
 app.use(express.json({ limit: '100kb' }));
 
 const PORT = process.env.PORT || 3001;
+
+const importedLegacyEntries = backfillLegacyEntries();
+if (importedLegacyEntries > 0) {
+  console.log(`  Imported ${importedLegacyEntries} legacy symptom entries into the audit ledger.\n`);
+}
 
 const MINUTE = 60e3;
 const loginLimiter = rateLimit({
