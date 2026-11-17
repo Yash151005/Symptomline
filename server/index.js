@@ -2,20 +2,56 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { v4 as uuid } from 'uuid';
-import PDFDocument from 'pdfkit';
 import db from './db.js';
-import { registerUser, loginUser, authMiddleware } from './auth.js';
+import {
+  registerUser, loginUser, authMiddleware, logout, logoutEverywhere, purgeExpiredSessions, deleteAccount,
+} from './auth.js';
 import { normalizeSymptom } from './normalizer.js';
-import { detectPatterns, getSymptomDiff, predictDoctorQuestions } from './patterns.js';
+import { detectPatterns, getSymptomDiff, predictDoctorQuestions, getTriggerAnalysis } from './patterns.js';
+import { screenRedFlags } from './redflags.js';
+import { localDayKey } from './stats.js';
+import { appendLedger, verifyLedger, entryHistory, loggingTimeliness, canonical, entrySnapshot } from './ledger.js';
+import { createShare, listShares, revokeShare, shareAccessLog, openShare } from './sharing.js';
+import { collectReportData, renderReportPdf, clinicianSummary } from './report.js';
+import { buildFhirBundle } from './fhir.js';
+import { securityHeaders, rateLimit } from './security.js';
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.disable('x-powered-by');
+// Behind a reverse proxy set TRUST_PROXY=1 so req.ip / req.secure are correct.
+if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
+app.use(securityHeaders);
+// The Vite dev server proxies /api, so the browser is same-origin. Only
+// explicitly listed origins may call the API cross-origin.
+const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173').split(',').map((s) => s.trim()).filter(Boolean);
+app.use(cors({ origin: allowedOrigins }));
+app.use(express.json({ limit: '100kb' }));
 
 const PORT = process.env.PORT || 3001;
 
+const MINUTE = 60e3;
+const loginLimiter = rateLimit({
+  windowMs: 15 * MINUTE, max: 10,
+  key: (req) => `${req.ip}|${String(req.body?.email || '').toLowerCase()}`,
+  message: 'Too many login attempts. Try again in 15 minutes.',
+});
+const registerLimiter = rateLimit({ windowMs: 60 * MINUTE, max: 10, key: (req) => req.ip });
+const sharedLimiter = rateLimit({ windowMs: MINUTE, max: 30, key: (req) => req.ip });
+const sensitiveLimiter = rateLimit({ windowMs: 15 * MINUTE, max: 5, key: (req) => `${req.ip}|${req.user?.id}` });
+
+function isValidTimestamp(ts) {
+  return typeof ts === 'string' && ts.length <= 40 && !Number.isNaN(Date.parse(ts));
+}
+
+function parseEntry(e) {
+  if (!e) return e;
+  e.context_tags = JSON.parse(e.context_tags || '[]');
+  e.red_flags = JSON.parse(e.red_flags || '[]');
+  return e;
+}
+
 // ──── Auth Routes ────
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', registerLimiter, (req, res) => {
   try {
     const { name, email, password } = req.body;
     if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
@@ -26,44 +62,61 @@ app.post('/api/auth/register', (req, res) => {
   }
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', loginLimiter, (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     const result = loginUser(email, password);
+    loginLimiter.reset(`${req.ip}|${String(email).toLowerCase()}`);
     res.json(result);
   } catch (err) {
     res.status(401).json({ error: err.message });
   }
 });
 
+app.post('/api/auth/logout', authMiddleware, (req, res) => {
+  logout(req.sessionToken);
+  res.json({ ok: true });
+});
+
+// Sign out of every device, e.g. after a lost phone.
+app.post('/api/auth/logout-all', authMiddleware, (req, res) => {
+  res.json({ ok: true, sessions_revoked: logoutEverywhere(req.user.id) });
+});
+
 // ──── Symptom Entries ────
 app.post('/api/entries', authMiddleware, async (req, res) => {
   try {
     const { raw_text, timestamp } = req.body;
-    if (!raw_text) return res.status(400).json({ error: 'Text is required' });
+    if (!raw_text || typeof raw_text !== 'string') return res.status(400).json({ error: 'Text is required' });
+    if (raw_text.length > 2000) return res.status(400).json({ error: 'Entry is too long (max 2000 characters)' });
+    if (timestamp !== undefined && !isValidTimestamp(timestamp)) return res.status(400).json({ error: 'Invalid timestamp' });
 
     const id = uuid();
     const ts = timestamp || new Date().toISOString();
+
+    // Safety screening runs first and independently of the LLM.
+    const redFlags = screenRedFlags(raw_text);
 
     // Normalize the symptom
     const normalized = await normalizeSymptom(raw_text, ts);
 
     db.prepare(`
-      INSERT INTO symptom_entries (id, profile_id, timestamp, raw_text, normalized_symptom, severity, body_location, context_tags, source)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO symptom_entries (id, profile_id, timestamp, raw_text, normalized_symptom, severity, body_location, context_tags, source, red_flags)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, req.profileId, ts, raw_text,
       normalized.normalized_symptom,
       normalized.severity,
       normalized.body_location,
       JSON.stringify(normalized.context_tags),
-      'text'
+      'text',
+      JSON.stringify(redFlags)
     );
 
-    const entry = db.prepare('SELECT * FROM symptom_entries WHERE id = ?').get(id);
-    entry.context_tags = JSON.parse(entry.context_tags);
-    res.json(entry);
+    const created = db.prepare('SELECT * FROM symptom_entries WHERE id = ?').get(id);
+    appendLedger(req.profileId, created, 'create');
+    res.json(parseEntry(created));
   } catch (err) {
     console.error('Entry creation error:', err);
     res.status(500).json({ error: 'Failed to create entry' });
@@ -74,8 +127,7 @@ app.get('/api/entries', authMiddleware, (req, res) => {
   const entries = db
     .prepare('SELECT * FROM symptom_entries WHERE profile_id = ? ORDER BY timestamp DESC')
     .all(req.profileId);
-  entries.forEach((e) => { e.context_tags = JSON.parse(e.context_tags); });
-  res.json(entries);
+  res.json(entries.map(parseEntry));
 });
 
 // Retroactive timeline correction — update an entry
@@ -85,25 +137,36 @@ app.put('/api/entries/:id', authMiddleware, async (req, res) => {
     if (!entry) return res.status(404).json({ error: 'Entry not found' });
 
     const { raw_text, timestamp, severity } = req.body;
+    if (raw_text !== undefined && (typeof raw_text !== 'string' || raw_text.length > 2000)) {
+      return res.status(400).json({ error: 'Invalid entry text' });
+    }
+    if (timestamp !== undefined && timestamp !== null && !isValidTimestamp(timestamp)) {
+      return res.status(400).json({ error: 'Invalid timestamp' });
+    }
+    if (severity !== undefined && !(Number.isInteger(Number(severity)) && severity >= 1 && severity <= 5)) {
+      return res.status(400).json({ error: 'Severity must be a whole number from 1 to 5' });
+    }
 
     if (raw_text && raw_text !== entry.raw_text) {
       // Re-normalize if text changed
       const normalized = await normalizeSymptom(raw_text, timestamp || entry.timestamp);
+      const redFlags = screenRedFlags(raw_text);
       db.prepare(`
         UPDATE symptom_entries SET raw_text = ?, normalized_symptom = ?, severity = ?,
-        body_location = ?, context_tags = ?, original_timestamp = COALESCE(original_timestamp, timestamp),
+        body_location = ?, context_tags = ?, red_flags = ?, red_flag_acknowledged_at = NULL,
+        original_timestamp = COALESCE(original_timestamp, timestamp),
         timestamp = ?, edited_at = datetime('now')
         WHERE id = ?
       `).run(
         raw_text, normalized.normalized_symptom, normalized.severity,
-        normalized.body_location, JSON.stringify(normalized.context_tags),
+        normalized.body_location, JSON.stringify(normalized.context_tags), JSON.stringify(redFlags),
         timestamp || entry.timestamp, req.params.id
       );
     } else {
       // Update timestamp or severity only
       const updates = {};
-      if (timestamp) updates.timestamp = timestamp;
-      if (severity !== undefined) updates.severity = severity;
+      if (timestamp && timestamp !== entry.timestamp) updates.timestamp = timestamp;
+      if (severity !== undefined && Number(severity) !== entry.severity) updates.severity = Number(severity);
 
       if (Object.keys(updates).length > 0) {
         const setClause = Object.keys(updates).map((k) => `${k} = ?`).join(', ');
@@ -115,8 +178,8 @@ app.put('/api/entries/:id', authMiddleware, async (req, res) => {
     }
 
     const updated = db.prepare('SELECT * FROM symptom_entries WHERE id = ?').get(req.params.id);
-    updated.context_tags = JSON.parse(updated.context_tags);
-    res.json(updated);
+    if (canonical(entrySnapshot(updated)) !== canonical(entrySnapshot(entry))) appendLedger(req.profileId, updated, 'update');
+    res.json(parseEntry(updated));
   } catch (err) {
     console.error('Entry update error:', err);
     res.status(500).json({ error: 'Failed to update entry' });
@@ -124,8 +187,122 @@ app.put('/api/entries/:id', authMiddleware, async (req, res) => {
 });
 
 app.delete('/api/entries/:id', authMiddleware, (req, res) => {
-  db.prepare('DELETE FROM symptom_entries WHERE id = ? AND profile_id = ?').run(req.params.id, req.profileId);
+  const entry = db.prepare('SELECT * FROM symptom_entries WHERE id = ? AND profile_id = ?').get(req.params.id, req.profileId);
+  if (entry) {
+    db.transaction(() => {
+      db.prepare('DELETE FROM symptom_entries WHERE id = ?').run(entry.id);
+      appendLedger(req.profileId, entry, 'delete');
+    })();
+  }
   res.json({ ok: true });
+});
+
+// Every recorded version of an entry, from the tamper-evident ledger.
+app.get('/api/entries/:id/history', authMiddleware, (req, res) => {
+  res.json(entryHistory(req.profileId, req.params.id));
+});
+
+// Patient confirms they have seen the safety guidance for a flagged entry.
+app.post('/api/entries/:id/acknowledge-flags', authMiddleware, (req, res) => {
+  const result = db.prepare(`
+    UPDATE symptom_entries SET red_flag_acknowledged_at = datetime('now')
+    WHERE id = ? AND profile_id = ? AND red_flag_acknowledged_at IS NULL
+  `).run(req.params.id, req.profileId);
+  const entry = db.prepare('SELECT * FROM symptom_entries WHERE id = ? AND profile_id = ?').get(req.params.id, req.profileId);
+  if (!entry) return res.status(404).json({ error: 'Entry not found' });
+  // Medico-legal record that the patient was shown the emergency guidance.
+  if (result.changes) appendLedger(req.profileId, entry, 'acknowledge');
+  res.json({ ok: true, updated: result.changes, entry: parseEntry(entry) });
+});
+
+// ──── Daily Check-ins ────
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseCheckin(c) {
+  if (!c) return c;
+  c.tags = JSON.parse(c.tags || '[]');
+  c.symptom_free = !!c.symptom_free;
+  return c;
+}
+
+function numOrNull(v, { min, max, int = false }) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < min || n > max) throw new Error(`Value out of range (${min}–${max})`);
+  return int ? Math.round(n) : n;
+}
+
+app.get('/api/checkins', authMiddleware, (req, res) => {
+  const days = Math.min(365, parseInt(req.query.days) || 30);
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+  const rows = db
+    .prepare('SELECT * FROM daily_checkins WHERE profile_id = ? AND date >= ? ORDER BY date DESC')
+    .all(req.profileId, localDayKey(since));
+  res.json(rows.map(parseCheckin));
+});
+
+app.get('/api/checkins/:date', authMiddleware, (req, res) => {
+  if (!DATE_RE.test(req.params.date)) return res.status(400).json({ error: 'Date must be YYYY-MM-DD' });
+  const row = db.prepare('SELECT * FROM daily_checkins WHERE profile_id = ? AND date = ?').get(req.profileId, req.params.date);
+  res.json(row ? parseCheckin(row) : null);
+});
+
+app.put('/api/checkins/:date', authMiddleware, (req, res) => {
+  const { date } = req.params;
+  if (!DATE_RE.test(date) || Number.isNaN(Date.parse(date))) return res.status(400).json({ error: 'Date must be YYYY-MM-DD' });
+  // Allow one day of clock skew between client and server.
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  if (date > localDayKey(tomorrow)) return res.status(400).json({ error: 'Cannot check in for a future date' });
+
+  try {
+    const b = req.body || {};
+    const tags = Array.isArray(b.tags)
+      ? [...new Set(b.tags.filter((t) => typeof t === 'string' && t.trim()).map((t) => t.trim().toLowerCase().replace(/\s+/g, '_').slice(0, 40)))].slice(0, 20)
+      : [];
+    const values = {
+      sleep_hours: numOrNull(b.sleep_hours, { min: 0, max: 24 }),
+      sleep_quality: numOrNull(b.sleep_quality, { min: 1, max: 5, int: true }),
+      stress: numOrNull(b.stress, { min: 1, max: 5, int: true }),
+      caffeine_cups: numOrNull(b.caffeine_cups, { min: 0, max: 30, int: true }),
+      alcohol_units: numOrNull(b.alcohol_units, { min: 0, max: 50, int: true }),
+      exercise_minutes: numOrNull(b.exercise_minutes, { min: 0, max: 1440, int: true }),
+      screen_hours: numOrNull(b.screen_hours, { min: 0, max: 24 }),
+      tags: JSON.stringify(tags),
+      symptom_free: b.symptom_free ? 1 : 0,
+      notes: typeof b.notes === 'string' ? b.notes.slice(0, 1000) : null,
+    };
+
+    db.prepare(`
+      INSERT INTO daily_checkins (id, profile_id, date, sleep_hours, sleep_quality, stress, caffeine_cups,
+        alcohol_units, exercise_minutes, screen_hours, tags, symptom_free, notes)
+      VALUES (@id, @profile_id, @date, @sleep_hours, @sleep_quality, @stress, @caffeine_cups,
+        @alcohol_units, @exercise_minutes, @screen_hours, @tags, @symptom_free, @notes)
+      ON CONFLICT (profile_id, date) DO UPDATE SET
+        sleep_hours = excluded.sleep_hours, sleep_quality = excluded.sleep_quality, stress = excluded.stress,
+        caffeine_cups = excluded.caffeine_cups, alcohol_units = excluded.alcohol_units,
+        exercise_minutes = excluded.exercise_minutes, screen_hours = excluded.screen_hours,
+        tags = excluded.tags, symptom_free = excluded.symptom_free, notes = excluded.notes,
+        updated_at = datetime('now')
+    `).run({ id: uuid(), profile_id: req.profileId, date, ...values });
+
+    res.json(parseCheckin(db.prepare('SELECT * FROM daily_checkins WHERE profile_id = ? AND date = ?').get(req.profileId, date)));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ──── Trigger analysis (statistical engine summary) ────
+app.get('/api/triggers', authMiddleware, (req, res) => {
+  const analysis = getTriggerAnalysis(req.profileId);
+  res.json({
+    ready: analysis.ready,
+    observedDays: analysis.observedDays,
+    minDays: analysis.minDays,
+    testsRun: analysis.testsRun,
+    findingCount: analysis.findings.length,
+  });
 });
 
 // ──── Treatments ────
@@ -176,205 +353,126 @@ app.get('/api/questions/:specialty', authMiddleware, (req, res) => {
 });
 
 // ──── PDF Export ────
+const SPECIALTY_IDS = ['neurologist', 'gastroenterologist', 'orthopedist', 'psychiatrist', 'general'];
+
+function pdfFileName(specialty) {
+  return `noted-report-${specialty}-${new Date().toISOString().split('T')[0]}.pdf`;
+}
+
 app.get('/api/report/:specialty/pdf', authMiddleware, (req, res) => {
-  const specialty = req.params.specialty;
-  const entries = db
-    .prepare('SELECT * FROM symptom_entries WHERE profile_id = ? ORDER BY timestamp DESC')
-    .all(req.profileId);
-  entries.forEach((e) => { e.context_tags = JSON.parse(e.context_tags); });
-
-  const treatments = db.prepare('SELECT * FROM treatments WHERE profile_id = ?').all(req.profileId);
-  const patterns = detectPatterns(req.profileId);
-  const questions = predictDoctorQuestions(req.profileId, specialty);
-
-  // Build frequency table
-  const freq = {};
-  entries.forEach((e) => {
-    if (!freq[e.normalized_symptom]) freq[e.normalized_symptom] = { count: 0, totalSev: 0 };
-    freq[e.normalized_symptom].count++;
-    freq[e.normalized_symptom].totalSev += e.severity;
-  });
-
-  const doc = new PDFDocument({ size: 'A4', margin: 40, autoFirstPage: true });
-
-  const fileName = `noted-report-${specialty}-${new Date().toISOString().split('T')[0]}.pdf`;
+  const specialty = SPECIALTY_IDS.includes(req.params.specialty) ? req.params.specialty : 'general';
+  const windowDays = [30, 60, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 90;
+  const data = collectReportData(req.profileId, { specialty, windowDays });
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-  res.setHeader('Content-Transfer-Encoding', 'binary');
-  doc.pipe(res);
+  res.setHeader('Content-Disposition', `attachment; filename="${pdfFileName(specialty)}"`);
+  renderReportPdf(res, data, { userName: req.user?.name || 'Patient' });
+});
 
-  const specialtyTheme = {
-    neurologist: { primary: '#6c5ce7', light: '#f0eeff', label: 'Neurology Consultation Report', sub: 'Cranial, Migraine & Neurological Assessment' },
-    gastroenterologist: { primary: '#00cec9', light: '#e6fffe', label: 'Gastroenterology Report', sub: 'Upper & Lower GI Motility & Reflux Assessment' },
-    orthopedist: { primary: '#e17055', light: '#fff4f0', label: 'Orthopedic & Spine Report', sub: 'Musculoskeletal, Lumbar & Postural Assessment' },
-    psychiatrist: { primary: '#e84393', light: '#fdeef6', label: 'Mental Health & Cardiology Report', sub: 'Autonomic, Stress, Palpitations & Sleep Assessment' },
-    general: { primary: '#6c5ce7', light: '#f0eeff', label: 'Clinical Health Summary', sub: 'Comprehensive Multisystem Longitudinal Review' },
+// ──── Timeline integrity ────
+app.get('/api/integrity', authMiddleware, (req, res) => {
+  res.json({ ...verifyLedger(req.profileId), timeliness: loggingTimeliness(req.profileId) });
+});
+
+// ──── Clinician share links (patient side) ────
+app.get('/api/shares', authMiddleware, (req, res) => {
+  res.json(listShares(req.profileId));
+});
+
+app.post('/api/shares', authMiddleware, (req, res) => {
+  try {
+    res.json(createShare(req.profileId, req.body));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/shares/:id', authMiddleware, (req, res) => {
+  const changed = revokeShare(req.profileId, req.params.id);
+  res.json({ ok: true, revoked: changed > 0 });
+});
+
+app.get('/api/shares/:id/access-log', authMiddleware, (req, res) => {
+  const log = shareAccessLog(req.profileId, req.params.id);
+  if (!log) return res.status(404).json({ error: 'Link not found' });
+  res.json(log);
+});
+
+// ──── Clinician share links (public, token-authenticated) ────
+function sharedRequest(req, res, resource) {
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  const result = openShare(req.params.token, {
+    resource, ip: req.ip, userAgent: req.headers['user-agent'], consumesView: resource === 'summary',
+  });
+  if (result.error) {
+    res.status(result.status).json({ error: result.error });
+    return null;
+  }
+  const { link } = result;
+  const profile = db.prepare('SELECT * FROM profiles WHERE id = ?').get(link.profile_id);
+  const data = collectReportData(link.profile_id, { specialty: link.specialty, windowDays: link.window_days });
+  return { link, profile, data };
+}
+
+app.get('/api/shared/:token', sharedLimiter, (req, res) => {
+  const ctx = sharedRequest(req, res, 'summary');
+  if (!ctx) return;
+  res.json(clinicianSummary(ctx.data, {
+    patientName: ctx.profile?.name || 'Patient',
+    includeRawText: !!ctx.link.include_raw_text,
+    expiresAt: ctx.link.expires_at,
+  }));
+});
+
+app.get('/api/shared/:token/pdf', sharedLimiter, (req, res) => {
+  const ctx = sharedRequest(req, res, 'pdf');
+  if (!ctx) return;
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${pdfFileName(ctx.link.specialty)}"`);
+  renderReportPdf(res, ctx.data, {
+    userName: ctx.profile?.name || 'Patient',
+    includeRawText: !!ctx.link.include_raw_text,
+    sharedVia: ctx.link.id,
+  });
+});
+
+// ──── Data portability & erasure (GDPR Art. 15/17/20, India DPDP Act 2023) ────
+function profileExport(profileId) {
+  return {
+    profile: db.prepare('SELECT id, name, relation, created_at FROM profiles WHERE id = ?').get(profileId),
+    entries: db.prepare('SELECT * FROM symptom_entries WHERE profile_id = ? ORDER BY timestamp').all(profileId).map(parseEntry),
+    treatments: db.prepare('SELECT * FROM treatments WHERE profile_id = ? ORDER BY start_date').all(profileId),
+    checkins: db.prepare('SELECT * FROM daily_checkins WHERE profile_id = ? ORDER BY date').all(profileId).map(parseCheckin),
   };
+}
 
-  const theme = specialtyTheme[specialty] || specialtyTheme.general;
-  const userName = req.user?.name || 'Patient';
-
-  // ──── Top Header Banner ────
-  doc.rect(40, 40, 515, 80).fill(theme.primary);
-  doc.fillColor('#ffffff').fontSize(22).font('Helvetica-Bold').text('Noted.', 58, 55);
-  doc.fontSize(8).font('Helvetica-Bold').fillColor('#ffffff').text('CLINICAL VISIT DOSSIER', 58, 82);
-
-  doc.fillColor('#ffffff').fontSize(13).font('Helvetica-Bold').text(theme.label.toUpperCase(), 180, 55, { align: 'right', width: 355 });
-  doc.fontSize(8.5).font('Helvetica').fillColor('#f0f2f7').text(theme.sub, 180, 72, { align: 'right', width: 355 });
-  doc.fontSize(8).text(`Patient: ${userName}  |  Generated: ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}`, 180, 88, { align: 'right', width: 355 });
-
-  // ──── KPI Cards (4 Grid Boxes) ────
-  const kpiY = 135;
-  const cardW = 120;
-  const cardH = 50;
-  const cardGap = 11.6;
-
-  const avgSev = entries.length ? (entries.reduce((a, b) => a + b.severity, 0) / entries.length).toFixed(1) : '0';
-  const kpis = [
-    { label: 'TOTAL ENTRIES', val: `${entries.length}`, color: '#6c5ce7', bg: '#f4f2ff' },
-    { label: 'AVG SEVERITY', val: `${avgSev} / 5`, color: '#e17055', bg: '#fff4f0' },
-    { label: 'PATTERNS FOUND', val: `${patterns.length}`, color: '#00b894', bg: '#e6f9f3' },
-    { label: 'ACTIVE TREATMENTS', val: `${treatments.filter(t => !t.end_date).length}`, color: '#00cec9', bg: '#e6fffe' },
-  ];
-
-  kpis.forEach((kpi, i) => {
-    const x = 40 + i * (cardW + cardGap);
-    doc.roundedRect(x, kpiY, cardW, cardH, 6).fillAndStroke(kpi.bg, kpi.color);
-    doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#7a829e').text(kpi.label, x + 8, kpiY + 10, { width: cardW - 16, align: 'center' });
-    doc.fontSize(15).font('Helvetica-Bold').fillColor(kpi.color).text(kpi.val, x + 8, kpiY + 24, { width: cardW - 16, align: 'center' });
+app.get('/api/export/json', authMiddleware, (req, res) => {
+  const data = profileExport(req.profileId);
+  const shares = listShares(req.profileId);
+  res.setHeader('Content-Disposition', `attachment; filename="noted-export-${localDayKey(new Date())}.json"`);
+  res.json({
+    format: 'noted-export/v1',
+    exported_at: new Date().toISOString(),
+    user: { name: req.user.name, email: req.user.email },
+    ...data,
+    audit_ledger: db.prepare('SELECT seq, entry_id, action, payload, at, prev_hash, hash FROM audit_ledger WHERE profile_id = ? ORDER BY seq').all(req.profileId),
+    share_links: shares.map((s) => ({ ...s, access_log: shareAccessLog(req.profileId, s.id) })),
   });
+});
 
-  let curY = 202;
+app.get('/api/export/fhir', authMiddleware, (req, res) => {
+  const { profile, entries, treatments } = profileExport(req.profileId);
+  res.setHeader('Content-Type', 'application/fhir+json');
+  res.setHeader('Content-Disposition', `attachment; filename="noted-fhir-r4-${localDayKey(new Date())}.json"`);
+  res.send(JSON.stringify(buildFhirBundle({ profile, entries, treatments }), null, 2));
+});
 
-  // ──── SECTION 1: Symptom Frequency Table ────
-  doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Symptom Frequency & Intensity (Last 90 Days)', 40, curY);
-  curY += 18;
-
-  doc.roundedRect(40, curY, 515, 22, 4).fill(theme.primary);
-  doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#ffffff');
-  doc.text('Symptom Entity', 52, curY + 6);
-  doc.text('Occurrences', 260, curY + 6, { width: 80, align: 'center' });
-  doc.text('Avg Severity', 360, curY + 6, { width: 80, align: 'center' });
-  doc.text('Impact Level', 460, curY + 6, { width: 80, align: 'center' });
-  curY += 24;
-
-  const sortedFreq = Object.entries(freq).sort((a, b) => b[1].count - a[1].count).slice(0, 5);
-  sortedFreq.forEach(([symptom, data], idx) => {
-    const rowBg = idx % 2 === 0 ? '#f9fafd' : '#ffffff';
-    doc.rect(40, curY, 515, 20).fill(rowBg);
-    const avg = (data.totalSev / data.count).toFixed(1);
-    const sevNum = parseFloat(avg);
-    const impactLabel = sevNum >= 4 ? 'High' : sevNum >= 2.5 ? 'Moderate' : 'Mild';
-    const impactColor = sevNum >= 4 ? '#e17055' : sevNum >= 2.5 ? '#f39c12' : '#00b894';
-
-    doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#2d3436').text(symptom, 52, curY + 5);
-    doc.font('Helvetica').fillColor('#4a5568').text(`${data.count}`, 260, curY + 5, { width: 80, align: 'center' });
-    doc.text(`${avg} / 5`, 360, curY + 5, { width: 80, align: 'center' });
-    doc.font('Helvetica-Bold').fillColor(impactColor).text(impactLabel, 460, curY + 5, { width: 80, align: 'center' });
-    curY += 20;
-  });
-  curY += 14;
-
-  // ──── SECTION 2: Detected Patterns ────
-  if (patterns.length > 0) {
-    doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Detected Patterns & Clinical Correlations', 40, curY);
-    curY += 16;
-
-    patterns.slice(0, 3).forEach((p) => {
-      doc.roundedRect(40, curY, 515, 42, 5).fillAndStroke('#fcfdff', '#e2e6f0');
-      doc.rect(40, curY, 4, 42).fill(p.confidence >= 80 ? '#00b894' : '#6c5ce7');
-
-      doc.fontSize(9).font('Helvetica-Bold').fillColor('#1a1d2e').text(p.symptom, 54, curY + 7);
-      doc.fontSize(8).font('Helvetica-Bold').fillColor(p.confidence >= 80 ? '#00b894' : '#6c5ce7')
-        .text(`${p.confidence}% Statistical Confidence`, 350, curY + 7, { align: 'right', width: 190 });
-
-      doc.fontSize(8).font('Helvetica').fillColor('#4a5568').text(p.pattern, 54, curY + 20, { width: 485 });
-      doc.fontSize(7.5).font('Helvetica-Oblique').fillColor('#718096').text(p.suggestion, 54, curY + 30, { width: 485 });
-      curY += 48;
-    });
-    curY += 8;
+app.delete('/api/account', authMiddleware, sensitiveLimiter, (req, res) => {
+  try {
+    deleteAccount(req.user.id, req.body?.password);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
-
-  // ──── SECTION 3: Treatments ────
-  if (treatments.length > 0) {
-    doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Active & Recent Treatments', 40, curY);
-    curY += 16;
-
-    treatments.slice(0, 3).forEach((t) => {
-      const isOngoing = !t.end_date;
-      const badgeColor = isOngoing ? '#00b894' : '#9098b1';
-      const badgeText = isOngoing ? 'ACTIVE' : 'COMPLETED';
-
-      doc.roundedRect(40, curY, 515, 34, 4).fillAndStroke('#fcfdff', '#e5e9f2');
-      doc.fontSize(9).font('Helvetica-Bold').fillColor('#2d3436').text(t.name, 52, curY + 6);
-
-      doc.fontSize(7.5).font('Helvetica-Bold').fillColor(badgeColor).text(badgeText, 470, curY + 6, { align: 'right', width: 70 });
-      doc.fontSize(7.5).font('Helvetica').fillColor('#718096')
-        .text(`Started: ${new Date(t.start_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}${t.end_date ? `  |  Ended: ${new Date(t.end_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}` : ''}`, 52, curY + 18);
-      if (t.notes) {
-        doc.fontSize(7.5).font('Helvetica').fillColor('#4a5568').text(`Notes: ${t.notes}`, 220, curY + 18, { width: 320 });
-      }
-      curY += 38;
-    });
-  }
-
-  // ──── Page 1 Footer ────
-  doc.rect(40, 775, 515, 1).fill('#e2e6f0');
-  doc.fontSize(7.5).font('Helvetica').fillColor('#a0aec0')
-    .text('Confidential Medical Summary Prepared by Noted. Platform  •  Page 1 of 2', 40, 785, { align: 'center', width: 515, height: 11 });
-
-  // ──── Page 2: Consultation Questions & Timeline ────
-  doc.addPage({ margin: 40 });
-
-  // Header Banner Page 2
-  doc.rect(40, 40, 515, 30).fill(theme.primary);
-  doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold').text('NOTED. CLINICAL DOSSIER — CONTINUED', 52, 49);
-  doc.fontSize(8.5).font('Helvetica').text(`Patient: ${userName}  |  Specialty: ${specialty.toUpperCase()}`, 300, 50, { align: 'right', width: 240 });
-
-  let p2Y = 85;
-
-  // ──── SECTION 4: Doctor Questions Box ────
-  doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('High-Yield Questions for Consultation', 40, p2Y);
-  p2Y += 16;
-
-  const boxH = Math.max(80, 20 + questions.length * 18);
-  doc.roundedRect(40, p2Y, 515, boxH, 6).fillAndStroke(theme.light, theme.primary);
-  p2Y += 12;
-  questions.forEach((q, idx) => {
-    doc.fontSize(8.5).font('Helvetica-Bold').fillColor(theme.primary).text(`${idx + 1}.`, 54, p2Y);
-    doc.fontSize(8.5).font('Helvetica').fillColor('#2d3436').text(q, 70, p2Y, { width: 465, height: 14, ellipsis: true });
-    p2Y += 18;
-  });
-  p2Y += 16;
-
-  // ──── SECTION 5: Recent Timeline Logs ────
-  doc.fontSize(11).font('Helvetica-Bold').fillColor('#1a1d2e').text('Recent Longitudinal Symptom Logs', 40, p2Y);
-  p2Y += 16;
-
-  entries.slice(0, 6).forEach((e) => {
-    const dateStr = new Date(e.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    doc.roundedRect(40, p2Y, 515, 36, 4).fillAndStroke('#ffffff', '#edf0f7');
-
-    const sevColor = e.severity >= 4 ? '#e17055' : e.severity >= 3 ? '#f39c12' : '#00b894';
-    doc.circle(52, p2Y + 12, 4).fill(sevColor);
-
-    doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#1a1d2e').text(`${e.normalized_symptom} (${e.severity}/5)`, 62, p2Y + 7, { height: 12 });
-    doc.fontSize(7.5).font('Helvetica').fillColor('#8c94a8').text(dateStr, 350, p2Y + 7, { align: 'right', width: 190, height: 12 });
-    if (e.body_location) {
-      doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#6c5ce7').text(`[${e.body_location}]`, 62, p2Y + 20, { height: 12 });
-    }
-    doc.fontSize(7.5).font('Helvetica-Oblique').fillColor('#4a5568').text(`"${e.raw_text}"`, 170, p2Y + 20, { width: 370, height: 12, ellipsis: true });
-
-    p2Y += 40;
-  });
-
-  // ──── Page 2 Footer ────
-  doc.rect(40, 775, 515, 1).fill('#e2e6f0');
-  doc.fontSize(7.5).font('Helvetica').fillColor('#a0aec0')
-    .text('Confidential Medical Summary Prepared by Noted. Platform. For clinical informational review only.', 40, 782, { align: 'center', width: 515, height: 11 })
-    .text('Page 2 of 2  •  Not intended as a standalone diagnostic instrument.', 40, 793, { align: 'center', width: 515, height: 11 });
-
-  doc.end();
 });
 
 // ──── Stats ────
@@ -403,6 +501,9 @@ app.get('/api/stats', authMiddleware, (req, res) => {
     patternCount: patterns.length,
   });
 });
+
+purgeExpiredSessions();
+setInterval(purgeExpiredSessions, 60 * MINUTE).unref();
 
 app.listen(PORT, () => {
   console.log(`\n  🩺 Noted. server running on http://localhost:${PORT}\n`);

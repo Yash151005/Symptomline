@@ -2,8 +2,14 @@ import 'dotenv/config';
 import { v4 as uuid } from 'uuid';
 import db from './db.js';
 import { registerUser } from './auth.js';
+import { localDayKey } from './stats.js';
+import { appendLedger } from './ledger.js';
 
 // Clear existing data for a clean slate
+db.prepare('DELETE FROM share_access_log').run();
+db.prepare('DELETE FROM share_links').run();
+db.prepare('DELETE FROM audit_ledger').run();
+db.prepare('DELETE FROM daily_checkins').run();
 db.prepare('DELETE FROM sessions').run();
 db.prepare('DELETE FROM symptom_entries').run();
 db.prepare('DELETE FROM treatments').run();
@@ -33,6 +39,87 @@ function getTimeTag(hour) {
 
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function randBetween(min, max, step = 1) {
+  const steps = Math.round((max - min) / step);
+  return +(min + Math.floor(Math.random() * (steps + 1)) * step).toFixed(2);
+}
+
+const NON_EXPOSURE_TAGS = new Set([
+  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+  'morning', 'afternoon', 'evening', 'night', 'early_morning',
+]);
+const STRUCTURED_TAGS = new Set(['poor_sleep', 'stress', 'caffeine', 'screen_time', 'exercise', 'sedentary', 'alcohol']);
+
+/**
+ * Generate ~90% daily check-in coverage. Exposures recorded in the day's
+ * symptom entries are likely (not certain) to show up in that day's
+ * check-in, and appear with a low base rate on other days — giving the
+ * statistical trigger engine realistic, imperfect signal to find.
+ */
+function seedCheckins(profileId, entries) {
+  const tagsByDay = new Map();
+  const allExtraTags = new Set();
+  for (const e of entries) {
+    const key = localDayKey(e.timestamp);
+    if (!tagsByDay.has(key)) tagsByDay.set(key, new Set());
+    for (const t of JSON.parse(e.context_tags)) {
+      if (NON_EXPOSURE_TAGS.has(t)) continue;
+      tagsByDay.get(key).add(t);
+      if (!STRUCTURED_TAGS.has(t)) allExtraTags.add(t);
+    }
+  }
+  const extraPool = [...allExtraTags];
+  const chance = (p) => Math.random() < p;
+
+  const insert = db.prepare(`
+    INSERT INTO daily_checkins (id, profile_id, date, sleep_hours, sleep_quality, stress, caffeine_cups,
+      alcohol_units, exercise_minutes, screen_hours, tags, symptom_free, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  let count = 0;
+  const run = db.transaction(() => {
+    for (let daysAgo = 90; daysAgo >= 0; daysAgo--) {
+      if (daysAgo > 7 && !chance(0.9)) continue; // missed check-in
+      const key = localDayKey(generateDateForDay(daysAgo, 12, 0));
+      const dayTags = tagsByDay.get(key) || new Set();
+      const has = (t) => dayTags.has(t);
+
+      const poorSleep = has('poor_sleep') ? chance(0.85) : chance(0.12);
+      const highStress = has('stress') ? chance(0.85) : chance(0.12);
+      const heavyCaffeine = has('caffeine') ? chance(0.8) : chance(0.1);
+      const heavyScreens = has('screen_time') ? chance(0.8) : chance(0.15);
+      const drank = has('alcohol') ? chance(0.85) : chance(0.08);
+      let exerciseMinutes;
+      if (has('exercise')) exerciseMinutes = chance(0.85) ? randBetween(25, 60, 5) : 0;
+      else if (has('sedentary')) exerciseMinutes = chance(0.85) ? 0 : randBetween(20, 40, 5);
+      else exerciseMinutes = chance(0.45) ? 0 : randBetween(20, 45, 5);
+
+      const extras = [];
+      for (const t of dayTags) if (!STRUCTURED_TAGS.has(t) && chance(0.8)) extras.push(t);
+      for (const t of extraPool) if (!dayTags.has(t) && chance(0.08)) extras.push(t);
+
+      insert.run(
+        uuid(), profileId, key,
+        poorSleep ? randBetween(3.5, 5.5, 0.5) : randBetween(6.5, 8.5, 0.5),
+        poorSleep ? randBetween(1, 2) : randBetween(3, 5),
+        highStress ? randBetween(4, 5) : randBetween(1, 3),
+        heavyCaffeine ? randBetween(3, 5) : randBetween(0, 2),
+        drank ? randBetween(1, 3) : 0,
+        exerciseMinutes,
+        heavyScreens ? randBetween(7, 11, 0.5) : randBetween(2, 5.5, 0.5),
+        JSON.stringify([...new Set(extras)]),
+        tagsByDay.has(key) ? 0 : 1, // no entries logged that day
+
+        null
+      );
+      count++;
+    }
+  });
+  run();
+  return count;
 }
 
 const usersConfig = [
@@ -590,7 +677,32 @@ for (const u of usersConfig) {
 
   insertMany(entries);
 
-  console.log(`✅ Seeded ${u.name} with ${entries.length} rich entries and ${u.treatments.length} treatments.`);
+  // Replay a realistic audit history into the tamper-evident ledger: most
+  // entries logged within hours of onset, some backfilled days later, and
+  // the retroactively corrected ones recorded as create + update.
+  const MIN = 60e3;
+  const nowMs = Date.now();
+  const events = [];
+  for (const r of entries) {
+    const claimed = r.original_timestamp || r.timestamp;
+    const roll = Math.random();
+    const lagMs = roll < 0.8 ? (5 + Math.random() * 235) * MIN
+      : roll < 0.95 ? (6 + Math.random() * 24) * 60 * MIN
+      : (2 + Math.random() * 2) * 1440 * MIN;
+    const createdAt = Math.min(nowMs, Date.parse(claimed) + lagMs);
+    events.push({ at: createdAt, action: 'create', row: { ...r, timestamp: claimed } });
+    if (r.edited_at) {
+      events.push({ at: Math.min(nowMs, Math.max(createdAt + MIN, Date.parse(r.edited_at))), action: 'update', row: r });
+    }
+  }
+  events.sort((a, b) => a.at - b.at);
+  db.transaction(() => {
+    for (const ev of events) appendLedger(profileId, ev.row, ev.action, new Date(ev.at).toISOString());
+  })();
+
+  const checkinCount = seedCheckins(profileId, entries);
+
+  console.log(`✅ Seeded ${u.name} with ${entries.length} rich entries, ${checkinCount} daily check-ins and ${u.treatments.length} treatments.`);
   console.log(`   📧 Login: ${u.email}  |  🔑 Password: ${u.password}`);
 }
 

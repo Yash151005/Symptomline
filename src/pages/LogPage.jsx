@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import QuickEntry from '../components/QuickEntry';
 import TimelineList from '../components/TimelineList';
 import EditEntryModal from '../components/EditEntryModal';
+import DailyCheckIn from '../components/DailyCheckIn';
+import RedFlagAlert from '../components/RedFlagAlert';
 import { entries as entriesApi, analytics } from '../api';
 import { mockEntries } from '../data/mockData';
 import { format } from 'date-fns';
@@ -12,6 +14,7 @@ export default function LogPage() {
   const [stats, setStats] = useState({ today: 0, week: 0, avgSeverity: 0, patternCount: 0 });
   const [editEntry, setEditEntry] = useState(null);
   const [useMock, setUseMock] = useState(false);
+  const [alertEntry, setAlertEntry] = useState(null);
 
   useEffect(() => {
     loadData();
@@ -51,6 +54,7 @@ export default function LogPage() {
     try {
       const entry = await entriesApi.create(rawText);
       setEntries((prev) => [entry, ...prev]);
+      if (entry.red_flags?.length) setAlertEntry(entry);
       const statsData = await analytics.stats();
       setStats(statsData);
     } catch (err) {
@@ -68,8 +72,26 @@ export default function LogPage() {
       const updated = await entriesApi.update(id, updates);
       setEntries((prev) => prev.map((e) => (e.id === id ? updated : e)));
       setEditEntry(null);
+      if (updated.red_flags?.length && !updated.red_flag_acknowledged_at) setAlertEntry(updated);
     } catch (err) {
       console.error('Failed to update entry:', err);
+    }
+  };
+
+  const handleDelete = async (id) => {
+    if (useMock) {
+      setEntries((prev) => prev.filter((entry) => entry.id !== id));
+      setEditEntry(null);
+      return;
+    }
+    try {
+      await entriesApi.delete(id);
+      setEntries((prev) => prev.filter((entry) => entry.id !== id));
+      setStats(await analytics.stats());
+      setEditEntry(null);
+    } catch (err) {
+      console.error('Failed to delete entry:', err);
+      throw err;
     }
   };
 
@@ -103,6 +125,8 @@ export default function LogPage() {
       </div>
 
       <QuickEntry onSubmit={handleNewEntry} />
+
+      {!useMock && <DailyCheckIn onSaved={() => analytics.stats().then(setStats).catch(() => {})} />}
 
       {/* Stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 32, marginTop: 20 }}>
@@ -140,6 +164,22 @@ export default function LogPage() {
           entry={editEntry}
           onClose={() => setEditEntry(null)}
           onSave={handleEditSave}
+          onDelete={handleDelete}
+        />
+      )}
+
+      {alertEntry && (
+        <RedFlagAlert
+          flags={alertEntry.red_flags}
+          onAcknowledge={async () => {
+            try {
+              const { entry } = await entriesApi.acknowledgeFlags(alertEntry.id);
+              setEntries((prev) => prev.map((e) => (e.id === entry.id ? entry : e)));
+            } catch (err) {
+              console.error('Failed to record acknowledgement:', err);
+            }
+            setAlertEntry(null);
+          }}
         />
       )}
 

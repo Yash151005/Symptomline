@@ -42,6 +42,8 @@ async function request(path, options = {}) {
 export const auth = {
   register: (data) => request('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
   login: (data) => request('/auth/login', { method: 'POST', body: JSON.stringify(data) }),
+  // Best effort: the local session is cleared even if the server is unreachable.
+  logout: () => fetch(`${API_BASE}/auth/logout`, { method: 'POST', headers: headers() }).catch(() => {}),
 };
 
 // Entries
@@ -50,6 +52,21 @@ export const entries = {
   create: (raw_text, timestamp) => request('/entries', { method: 'POST', body: JSON.stringify({ raw_text, timestamp }) }),
   update: (id, data) => request(`/entries/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   delete: (id) => request(`/entries/${id}`, { method: 'DELETE' }),
+  acknowledgeFlags: (id) => request(`/entries/${id}/acknowledge-flags`, { method: 'POST' }),
+};
+
+// Daily check-ins (dates are the patient's local YYYY-MM-DD)
+export function localDateKey(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+export const checkins = {
+  list: (days = 30) => request(`/checkins?days=${days}`),
+  get: (date) => request(`/checkins/${date}`),
+  save: (date, data) => request(`/checkins/${date}`, { method: 'PUT', body: JSON.stringify(data) }),
 };
 
 // Treatments
@@ -66,41 +83,69 @@ export const analytics = {
   diff: (symptom, days = 60) => request(`/diff/${encodeURIComponent(symptom)}?days=${days}`),
   questions: (specialty) => request(`/questions/${specialty}`),
   stats: () => request('/stats'),
+  triggers: () => request('/triggers'),
 };
+
+// Authenticated binary download (PDF / JSON exports). The token travels in the
+// Authorization header only — never in the URL, where it would be logged.
+async function downloadFile(path, fileName, mime) {
+  const res = await fetch(`${API_BASE}${path}`, { headers: { Authorization: `Bearer ${getToken()}` } });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Download failed (${res.status})`);
+  }
+  const blob = new Blob([await res.arrayBuffer()], { type: mime });
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.style.display = 'none';
+  link.href = url;
+  link.setAttribute('download', fileName);
+  document.body.appendChild(link);
+  link.click();
+  setTimeout(() => {
+    link.remove();
+    window.URL.revokeObjectURL(url);
+  }, 3000);
+}
+
+const today = () => new Date().toISOString().split('T')[0];
 
 // Reports
 export const reports = {
-  downloadPdf: async (specialty) => {
-    const token = getToken();
-    const fileName = `noted-report-${specialty}-${new Date().toISOString().split('T')[0]}.pdf`;
+  downloadPdf: (specialty, days = 90) =>
+    downloadFile(`/report/${specialty}/pdf?days=${days}`, `noted-report-${specialty}-${today()}.pdf`, 'application/pdf'),
+};
 
-    const res = await fetch(`${API_BASE}/report/${specialty}/pdf?token=${encodeURIComponent(token)}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
+// Timeline integrity (tamper-evident ledger)
+export const integrity = {
+  status: () => request('/integrity'),
+  history: (entryId) => request(`/entries/${entryId}/history`),
+};
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || `Failed to download PDF (${res.status})`);
-    }
+// Clinician share links
+export const shares = {
+  list: () => request('/shares'),
+  create: (data) => request('/shares', { method: 'POST', body: JSON.stringify(data) }),
+  revoke: (id) => request(`/shares/${id}`, { method: 'DELETE' }),
+  accessLog: (id) => request(`/shares/${id}/access-log`),
+};
 
-    const arrayBuffer = await res.arrayBuffer();
-    const pdfBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
-    const url = window.URL.createObjectURL(pdfBlob);
-
-    const link = document.createElement('a');
-    link.style.display = 'none';
-    link.href = url;
-    link.setAttribute('download', fileName);
-    document.body.appendChild(link);
-    link.click();
-
-    setTimeout(() => {
-      if (document.body.contains(link)) {
-        document.body.removeChild(link);
-      }
-      window.URL.revokeObjectURL(url);
-    }, 3000);
+// Public, token-scoped clinician view. Uses plain fetch: a 401/410 here must
+// not log the viewer out of anything.
+export const shared = {
+  get: async (token) => {
+    const res = await fetch(`${API_BASE}/shared/${encodeURIComponent(token)}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`);
+    return data;
   },
+  pdfUrl: (token) => `${API_BASE}/shared/${encodeURIComponent(token)}/pdf`,
+};
+
+// Privacy & data rights
+export const privacy = {
+  exportJson: () => downloadFile('/export/json', `noted-export-${today()}.json`, 'application/json'),
+  exportFhir: () => downloadFile('/export/fhir', `noted-fhir-r4-${today()}.json`, 'application/fhir+json'),
+  logoutAll: () => request('/auth/logout-all', { method: 'POST' }),
+  deleteAccount: (password) => request('/account', { method: 'DELETE', body: JSON.stringify({ password }) }),
 };

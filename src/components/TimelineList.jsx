@@ -1,5 +1,5 @@
 import { format } from 'date-fns';
-import { Clock, MapPin, Edit3 } from 'lucide-react';
+import { Clock, MapPin, Edit3, ShieldAlert } from 'lucide-react';
 
 const severityLabels = ['', 'Minimal', 'Mild', 'Moderate', 'Severe', 'Extreme'];
 const severityColors = ['', '#00b894', '#74b9ff', '#fdcb6e', '#e17055', '#ff6b6b'];
@@ -128,6 +128,16 @@ export default function TimelineList({ entries, onEdit }) {
                     {entry.normalized_symptom}
                   </span>
                   <SeverityBar level={entry.severity} />
+                  {entry.red_flags?.length > 0 && (
+                    <span
+                      className="tag tag-danger"
+                      title={entry.red_flags[0].guidance}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontWeight: 700 }}
+                    >
+                      <ShieldAlert size={11} />
+                      {entry.red_flags[0].level === 'emergency' ? 'Safety alert' : 'See a doctor'}
+                    </span>
+                  )}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   {onEdit && (
@@ -187,7 +197,7 @@ export default function TimelineList({ entries, onEdit }) {
                     {entry.body_location}
                   </span>
                 )}
-                {entry.context_tags.slice(0, 4).map((tag) => (
+                {(entry.context_tags || []).slice(0, 4).map((tag) => (
                   <ContextTag key={tag} tag={tag} />
                 ))}
               </div>

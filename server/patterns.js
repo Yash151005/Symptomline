@@ -1,10 +1,87 @@
 import db from './db.js';
+import { analyzeTriggers, buildDailyDataset, exposureLabel } from './stats.js';
 
 /**
- * Detect confidence-scored patterns from symptom entries.
- * Returns correlations between symptoms and context tags.
+ * Run the statistical trigger engine (see stats.js) for a profile.
+ */
+export function getTriggerAnalysis(profileId) {
+  const entries = db
+    .prepare('SELECT id, timestamp, normalized_symptom FROM symptom_entries WHERE profile_id = ?')
+    .all(profileId);
+  const checkins = db.prepare('SELECT * FROM daily_checkins WHERE profile_id = ?').all(profileId);
+  return analyzeTriggers(buildDailyDataset(entries, checkins));
+}
+
+function fmt(n) {
+  return n >= 10 ? n.toFixed(0) : n.toFixed(1);
+}
+
+function pct(x) {
+  return `${Math.round(x * 100)}%`;
+}
+
+/** Turn a statistical finding into the pattern shape the UI / PDF consume. */
+function findingToPattern(f) {
+  const label = exposureLabel(f.exposure);
+  const days = f.lag === 1 ? `days after ${label}` : `days with ${label}`;
+  const ratio = `OR ${fmt(f.odds_ratio)} (95% CI ${fmt(f.ci_low)}–${fmt(f.ci_high)})`;
+  const pattern = f.direction === 'risk'
+    ? `${f.symptom} occurred on ${pct(f.risk_exposed)} of ${days} vs ${pct(f.risk_unexposed)} of other days — ${ratio}`
+    : `${f.symptom} was less likely on ${days} (${pct(f.risk_exposed)} vs ${pct(f.risk_unexposed)} of other days) — ${ratio}`;
+
+  return {
+    id: `stat-${f.symptom}-${f.exposure}-lag${f.lag}`,
+    method: 'statistical',
+    symptom: f.symptom,
+    trigger: f.exposure,
+    lag_days: f.lag,
+    direction: f.direction,
+    pattern,
+    // Kept for backwards compatibility with existing UI/PDF consumers:
+    // 100 × (1 − FDR-adjusted p-value).
+    confidence: Math.max(0, Math.min(99, Math.round((1 - f.q_value) * 100))),
+    stats: {
+      odds_ratio: f.odds_ratio,
+      ci_low: f.ci_low,
+      ci_high: f.ci_high,
+      p_value: f.p_value,
+      q_value: f.q_value,
+      days_analyzed: f.n,
+      table: f.table,
+      risk_exposed: f.risk_exposed,
+      risk_unexposed: f.risk_unexposed,
+    },
+    supporting_entries: f.supporting_entries,
+    suggestion: f.direction === 'risk'
+      ? `${getSuggestion(f.symptom, f.exposure)} This is an association, not proof of cause — a personal experiment can confirm it.`
+      : `${label[0].toUpperCase() + label.slice(1)} may be protective against ${f.symptom}. Worth keeping up and discussing with your doctor.`,
+  };
+}
+
+/**
+ * Detect patterns for a profile.
+ *
+ * When enough daily check-ins exist, returns statistically tested trigger
+ * findings (odds ratios with CIs, FDR-controlled). Descriptive patterns
+ * (co-occurrence within symptom entries, time-of-day, treatment) are
+ * appended and flagged `method: 'descriptive'` — they are hypotheses,
+ * not evidence.
  */
 export function detectPatterns(profileId) {
+  const analysis = getTriggerAnalysis(profileId);
+  const statistical = analysis.findings.map(findingToPattern);
+  // Drop descriptive "mentioned in X% of entries" patterns for any pair the
+  // engine has actually tested: either it is reported above, or the test
+  // found no real association and repeating the raw percentage would mislead.
+  const testedKeys = new Set(analysis.testedPairs);
+
+  const descriptive = detectDescriptivePatterns(profileId)
+    .filter((p) => !p.trigger || !testedKeys.has(`${p.symptom}|${p.trigger}`));
+
+  return [...statistical.slice(0, 8), ...descriptive].slice(0, 10);
+}
+
+function detectDescriptivePatterns(profileId) {
   const entries = db
     .prepare('SELECT * FROM symptom_entries WHERE profile_id = ? ORDER BY timestamp DESC')
     .all(profileId);
@@ -49,11 +126,13 @@ export function detectPatterns(profileId) {
         const formattedTag = tag.replace(/_/g, ' ');
         patterns.push({
           id: `${symptom}-${tag}`,
+          method: 'descriptive',
           symptom,
-          pattern: `${symptom} co-occurred with "${formattedTag}" in ${data.count} of ${symptomEntries.length} instances`,
+          trigger: tag,
+          pattern: `"${formattedTag}" was mentioned in ${data.count} of ${symptomEntries.length} ${symptom} entries`,
           confidence,
           supporting_entries: data.entries,
-          suggestion: getSuggestion(symptom, tag, confidence),
+          suggestion: `Not yet tested: this ignores how often "${formattedTag}" happens on symptom-free days. Keep doing daily check-ins so it can be tested statistically.`,
         });
       }
     }
@@ -70,6 +149,7 @@ export function detectPatterns(profileId) {
       const conf = Math.round((dominantTime[1] / symptomEntries.length) * 100);
       patterns.push({
         id: `${symptom}-time-${dominantTime[0]}`,
+        method: 'descriptive',
         symptom,
         pattern: `${symptom} predominantly occurs in the ${dominantTime[0].replace('_', ' ')} (${dominantTime[1]}/${symptomEntries.length} entries)`,
         confidence: conf,
@@ -99,6 +179,7 @@ export function detectPatterns(profileId) {
         const conf = Math.min(90, Math.round(60 + Math.abs(change) * 10));
         patterns.push({
           id: `treatment-${treatment.id}`,
+          method: 'descriptive',
           symptom: `Treatment: ${treatment.name}`,
           pattern: `Average severity ${direction} by ${Math.abs(change).toFixed(1)} points after starting ${treatment.name}`,
           confidence: conf,
@@ -117,7 +198,7 @@ export function detectPatterns(profileId) {
     .slice(0, 10);
 }
 
-function getSuggestion(symptom, tag, confidence) {
+function getSuggestion(symptom, tag) {
   const suggestions = {
     poor_sleep: `Strong link between sleep quality and ${symptom}. Track sleep hours alongside symptoms.`,
     stress: `Stress appears to be a significant trigger for ${symptom}. Consider stress management techniques.`,
@@ -130,7 +211,7 @@ function getSuggestion(symptom, tag, confidence) {
     spicy: `Spicy food correlates with ${symptom}. Consider dietary modifications.`,
     dairy: `Dairy consumption correlates with ${symptom}. Consider lactose sensitivity testing.`,
   };
-  return suggestions[tag] || `"${tag.replace(/_/g, ' ')}" appears to correlate with ${symptom} (${confidence}% confidence).`;
+  return suggestions[tag] || `"${exposureLabel(tag)}" is associated with ${symptom}.`;
 }
 
 /**

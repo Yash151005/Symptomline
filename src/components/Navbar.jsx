@@ -1,10 +1,11 @@
 import { NavLink } from 'react-router-dom';
-import { PenLine, Activity, FileText, LogOut } from 'lucide-react';
+import { PenLine, Activity, FileText, LogOut, Shield } from 'lucide-react';
 
 const navItems = [
   { to: '/', icon: PenLine, label: 'Log' },
   { to: '/timeline', icon: Activity, label: 'Timeline' },
   { to: '/report', icon: FileText, label: 'Report' },
+  { to: '/privacy', icon: Shield, label: 'Privacy' },
 ];
 
 export default function Navbar({ onLogout, userName }) {

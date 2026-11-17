@@ -1,14 +1,16 @@
 import { useState, useEffect } from 'react';
 import {
   FileText, X, Download, Brain, Stethoscope, HeartPulse,
-  ChevronRight, MessageCircleQuestion, Pill, BarChart3, Loader2, Activity
+  ChevronRight, MessageCircleQuestion, Pill, BarChart3, Loader2, Activity, Check, Link2, ShieldCheck
 } from 'lucide-react';
 import {
   mockEntries, mockPatterns, mockDoctorQuestions,
   mockTreatments
 } from '../data/mockData';
 import { format } from 'date-fns';
-import { entries as entriesApi, analytics, treatments as treatmentsApi, reports } from '../api';
+import { entries as entriesApi, analytics, treatments as treatmentsApi, reports, integrity as integrityApi } from '../api';
+import SharePanel from './SharePanel';
+import IntegrityBadge from './IntegrityBadge';
 
 const specialties = [
   { id: 'neurologist', label: 'Neurologist', icon: Brain, desc: 'Headaches, migraines, dizziness, brain fog', color: '#6c5ce7', bg: '#f0eeff' },
@@ -22,17 +24,26 @@ function ReportPreview({ specialty, onClose }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
+  const [checkedQuestions, setCheckedQuestions] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(`noted_prep_${specialty.id}`) || '[]');
+    } catch {
+      return [];
+    }
+  });
+  const [visitNotes, setVisitNotes] = useState(() => localStorage.getItem(`noted_visit_notes_${specialty.id}`) || '');
 
   useEffect(() => {
     async function loadData() {
       try {
-        const [entries, patterns, treatments, questions] = await Promise.all([
+        const [entries, patterns, treatments, questions, integrity] = await Promise.all([
           entriesApi.list(),
           analytics.patterns(),
           treatmentsApi.list(),
           analytics.questions(specialty.id),
+          integrityApi.status().catch(() => null),
         ]);
-        setData({ entries, patterns, treatments, questions, useMock: false });
+        setData({ entries, patterns, treatments, questions, integrity, useMock: false });
       } catch (err) {
         console.error('API failed, using mock data for report preview');
         setData({
@@ -49,6 +60,19 @@ function ReportPreview({ specialty, onClose }) {
     loadData();
   }, [specialty.id]);
 
+  const toggleQuestion = (index) => {
+    const next = checkedQuestions.includes(index)
+      ? checkedQuestions.filter((item) => item !== index)
+      : [...checkedQuestions, index];
+    setCheckedQuestions(next);
+    localStorage.setItem(`noted_prep_${specialty.id}`, JSON.stringify(next));
+  };
+
+  const updateVisitNotes = (value) => {
+    setVisitNotes(value);
+    localStorage.setItem(`noted_visit_notes_${specialty.id}`, value);
+  };
+
   if (loading) {
     return (
       <div style={{ padding: '60px', textAlign: 'center' }}>
@@ -58,7 +82,7 @@ function ReportPreview({ specialty, onClose }) {
     );
   }
 
-  const { entries, patterns, treatments, questions, useMock } = data;
+  const { entries, patterns, treatments, questions, integrity, useMock } = data;
 
   const specKeywords = {
     neurologist: ['headache', 'migraine', 'dizziness', 'neck', 'brain fog', 'aura'],
@@ -157,6 +181,12 @@ function ReportPreview({ specialty, onClose }) {
         ))}
       </div>
 
+      {integrity && (
+        <Section icon={ShieldCheck} title="Data Integrity" color={specialty.color}>
+          <IntegrityBadge integrity={integrity} />
+        </Section>
+      )}
+
       {/* Frequency Table */}
       {freq.length > 0 && (
         <Section icon={BarChart3} title="Symptom Frequency" color={specialty.color}>
@@ -196,13 +226,13 @@ function ReportPreview({ specialty, onClose }) {
                 style={{
                   padding: '14px 16px', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg)',
                   border: '1px solid var(--color-border-subtle)',
-                  borderLeft: `4px solid ${p.confidence >= 80 ? '#00b894' : '#e17055'}`,
+                  borderLeft: `4px solid ${p.stats ? '#00b894' : '#b2bec3'}`,
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                   <span style={{ fontWeight: 700, fontSize: '0.8125rem' }}>{p.symptom}</span>
-                  <span style={{ fontSize: '0.75rem', fontWeight: 800, color: p.confidence >= 80 ? '#00b894' : '#e17055' }}>
-                    {p.confidence}%
+                  <span style={{ fontSize: '0.75rem', fontWeight: 800, color: p.stats ? '#00b894' : '#9098b1' }}>
+                    {p.stats ? `OR ${p.stats.odds_ratio.toFixed(1)}×` : 'Hypothesis'}
                   </span>
                 </div>
                 <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)' }}>{p.pattern}</p>
@@ -239,15 +269,64 @@ function ReportPreview({ specialty, onClose }) {
       {/* Doctor Questions */}
       {questions.length > 0 && (
         <Section icon={MessageCircleQuestion} title="Questions Your Doctor May Ask" color={specialty.color}>
-          <div style={{ padding: '16px 18px', background: specialty.bg, borderRadius: 'var(--radius-sm)', border: `1px solid ${specialty.color}12` }}>
-            <ol style={{ margin: 0, paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ padding: '14px 16px', background: specialty.bg, borderRadius: 'var(--radius-sm)', border: `1px solid ${specialty.color}12` }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <span style={{ fontSize: '0.75rem', color: 'var(--color-text-secondary)', fontWeight: 600 }}>
+                Mark topics you have prepared
+              </span>
+              <span style={{ fontSize: '0.75rem', color: specialty.color, fontWeight: 800 }}>
+                {checkedQuestions.length}/{questions.length} ready
+              </span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {questions.map((q, i) => (
-                <li key={i} style={{ fontSize: '0.8125rem', color: 'var(--color-text-secondary)', lineHeight: 1.5, fontWeight: 500 }}>
-                  {q}
-                </li>
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => toggleQuestion(i)}
+                  style={{
+                    display: 'flex', alignItems: 'flex-start', gap: 9, border: 'none',
+                    background: 'transparent', padding: 0, textAlign: 'left', cursor: 'pointer',
+                    color: 'var(--color-text-secondary)', fontFamily: 'var(--font-sans)',
+                  }}
+                >
+                  <span style={{
+                    width: 18, height: 18, borderRadius: 5, flexShrink: 0, marginTop: 1,
+                    border: `1.5px solid ${checkedQuestions.includes(i) ? specialty.color : 'var(--color-border)'}`,
+                    background: checkedQuestions.includes(i) ? specialty.color : 'var(--color-surface)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}>
+                    {checkedQuestions.includes(i) && <Check size={12} color="white" strokeWidth={3} />}
+                  </span>
+                  <span style={{ fontSize: '0.8125rem', lineHeight: 1.5, fontWeight: 500 }}>{q}</span>
+                </button>
               ))}
-            </ol>
+            </div>
           </div>
+        </Section>
+      )}
+
+      <Section icon={FileText} title="Your Notes for the Visit" color={specialty.color}>
+        <textarea
+          className="input"
+          value={visitNotes}
+          onChange={(e) => updateVisitNotes(e.target.value)}
+          placeholder="What changed since your last visit? What do you want to make sure you mention?"
+          rows={4}
+          style={{ resize: 'vertical', lineHeight: 1.5, fontSize: '0.8125rem' }}
+        />
+        <p style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)', marginTop: 6 }}>
+          Saved privately in this browser and included in your visit-prep workspace.
+        </p>
+      </Section>
+
+      {!useMock && (
+        <Section icon={Link2} title="Share Securely with Your Clinician" color={specialty.color}>
+          <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
+            Send your doctor a read-only link instead of an attachment. No account needed on their side. You choose how long it works,
+            how much history it shows and how many times it opens, and you can see every time it is opened.
+          </p>
+          <SharePanel specialty={specialty.id} color={specialty.color} />
         </Section>
       )}
 
