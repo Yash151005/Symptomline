@@ -445,7 +445,7 @@ function profileExport(profileId) {
   };
 }
 
-app.get('/api/export/json', authMiddleware, (req, res) => {
+app.get(['/api/export', '/api/export/json'], authMiddleware, (req, res) => {
   const data = profileExport(req.profileId);
   const shares = listShares(req.profileId);
   res.setHeader('Content-Disposition', `attachment; filename="noted-export-${localDayKey(new Date())}.json"`);
